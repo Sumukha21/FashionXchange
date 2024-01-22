@@ -1,4 +1,4 @@
-# FashiionXchange
+# FashionXchange
 Text based modification of a person's outfit in existing photos.
 
 Reference:
