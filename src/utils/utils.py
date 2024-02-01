@@ -19,3 +19,25 @@ def get_obj_from_str(string, reload=False):
         module_imp = importlib.import_module(module)
         importlib.reload(module_imp)
     return getattr(importlib.import_module(module, package=None), cls)
+
+
+def text_file_reader(file_path):
+    """
+    Read the contents of a text file.
+    Args:
+        file_path (str): The path to the text file.
+    Returns:
+        list: A list containing the lines of text from the file.
+    """
+    try:
+        with open(file_path, 'r') as file:
+            lines = file.readlines()
+        return lines
+    
+    except FileNotFoundError:
+        print(f"File '{file_path}' not found.")
+        return None
+    except Exception as e:
+        print(f"Error reading file: {e}")
+        return None
+    
