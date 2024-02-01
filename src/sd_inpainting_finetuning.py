@@ -14,6 +14,7 @@ import math
 import torch
 import itertools
 import random
+from glob import glob
 import argparse
 import numpy as np
 import torch.nn.functional as F
@@ -332,33 +333,86 @@ class ClassDatasetSampleGeneraion(Dataset):
 
 
 class TrainDataset(Dataset):
-    def __init__(self, instance_image_captions, instance_image_dir, image_size=512, center_crop=False, class_image_dir=None, class_image_prompts_file=None, class_sample_generated_prompts=None):
-        self.image_captions = instance_image_captions
-        self.image_dir = instance_image_dir
-        self.transform = transforms.Compose(
+    def __init__(self, instance_image_captions_file, instance_image_dir, image_size=512, center_crop=False, class_image_dir=None, class_image_prompts_file=None, class_sample_generated_prompts=None):
+        self.instance_image_captions = self.caption_file_reader(instance_image_captions_file)
+        if class_image_prompts_file is not None:
+            self.class_image_captions = self.caption_file_reader(class_image_prompts_file)
+        else:
+            self.class_image_captions = dict()
+        if class_sample_generated_prompts is not None:
+            self.class_image_captions.update(class_sample_generated_prompts)
+        self.instance_image_list = glob(os.path.join(instance_image_dir, '*.jpg'))
+        if class_image_dir is not None:
+            self.class_image_list = glob(os.path.join(class_image_dir, '*.jpg'))
+        else:
+            self.class_image_list = None
+        self.image_transforms_resize_and_crop = transforms.Compose(
             [
                 transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BILINEAR),
                 transforms.CenterCrop(image_size) if center_crop else transforms.RandomCrop(image_size),
+            ]
+        )
+
+        self.image_transforms = transforms.Compose(
+            [
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
             ]
         )
-        # Get list of image paths
-        self.image_paths = [os.path.join(instance_image_dir, img_name) for img_name in self.image_captions.keys()]
 
     def __len__(self):
         return len(self.image_captions)
+    
+    @staticmethod
+    def caption_file_reader(captions_file_path, image_directory=None):
+        ext = os.path.splitext(captions_file_path)[1]
+        if captions_file_path.endswith(".txt"):
+            assert image_directory is not None
+            captions = text_file_reader(captions_file_path)
+            image_vs_captions = dict()
+            img_list = glob(os.path.join(image_directory, '*.jpg'))
+            for img_path, caption in zip(img_list, captions):
+                img_name = os.path.basename(img_path)
+                image_vs_captions[img_name] = caption
+            return image_vs_captions
+        elif captions_file_path.endswith(".json"):
+            """
+            Code for creating a dictionary of image_name vs captions by reading a json file 
+            """
+            pass  
+        elif captions_file_path.endswith(".yaml"):
+            """
+            Code for creating a dictionary of image_name vs captions by reading a yaml file 
+            """
+            pass
 
     def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        image = Image.open(img_path).convert('RGB')
+        example = dict()
+        image_name = os.path.basename(self.instance_image_list[idx])
+        instance_image = Image.open(self.instance_image_list[idx])
+        instance_image = self.image_transforms_resize_and_crop(instance_image)
+        example["PIL_images"] = instance_image
+        example["instance_images"] = self.image_transforms(instance_image)
+        example["instance_prompt_ids"] = self.tokenizer(
+            self.instance_image_captions[image_name],
+            padding="do_not_pad",
+            truncation=True,
+            max_length=self.tokenizer.model_max_length,
+        ).input_ids
+        if self.class_image_list is not None:
+            class_image_name = os.path.basename(self.class_image_list[idx])
+            class_image = Image.open(self.class_image_list[idx])
+            class_image = self.image_transforms_resize_and_crop(class_image)
+            example["class_images"] = class_image
+            example["class_PIL_images"] = self.image_transforms(class_image)
+            example["class_prompt_ids"] = self.tokenizer(
+                self.class_image_captions[class_image_name],
+                padding="do_not_pad",
+                truncation=True,
+                max_length=self.tokenizer.model_max_length,
+            ).input_ids
+        return example
 
-        caption = self.image_captions[os.path.basename(img_path)]
-
-        if self.transform:
-            image = self.transform(image)
-
-        return image, caption
 
 def model_finetuning():
     args = parse_args()
