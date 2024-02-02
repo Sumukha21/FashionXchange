@@ -39,7 +39,7 @@ from huggingface_hub.utils import insecure_hashlib
 from huggingface_hub import create_repo, upload_folder
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
-from utils.utils import text_file_reader
+from src.utils.utils import text_file_reader
 
 
 logger = get_logger(__name__)
@@ -338,12 +338,14 @@ class TrainDataset(Dataset):
             self, 
             instance_image_captions_file, 
             instance_image_dir, 
+            tokenizer,
             image_size=512, 
             center_crop=False, 
             class_image_dir=None, 
             class_image_prompts_file=None, 
             class_sample_generated_prompts=None):
         
+        self.tokenizer = tokenizer
         self.instance_image_captions = self.caption_file_reader(instance_image_captions_file)
         self._length = len(self.instance_image_captions.keys())
         # self.instance_image_list = glob(os.path.join(instance_image_dir, '*.jpg'))
@@ -359,7 +361,7 @@ class TrainDataset(Dataset):
        
 
         if class_image_dir is not None:
-            self.class_image_list = glob(os.path.join(class_image_dir, '*.jpg'))
+            self.class_image_list = glob(os.path.join(class_image_dir, '*.jpeg'))
         else:
             self.class_image_list = None
 
@@ -423,8 +425,8 @@ class TrainDataset(Dataset):
             class_image_name = os.path.basename(self.class_image_list[idx])
             class_image = Image.open(self.class_image_list[idx])
             class_image = self.image_transforms_resize_and_crop(class_image)
-            example["class_images"] = class_image
-            example["class_PIL_images"] = self.image_transforms(class_image)
+            example["class_images"] = self.image_transforms(class_image)
+            example["class_PIL_images"] = class_image
             example["class_prompt_ids"] = self.tokenizer(
                 self.class_image_captions[class_image_name],
                 padding="do_not_pad",
@@ -560,9 +562,10 @@ def model_finetuning():
 
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
-    train_dataset = TrainDataset(instance_image_captions=args.instance_image_captions_file,
+    train_dataset = TrainDataset(instance_image_captions_file=args.instance_image_captions_file,
                                  instance_image_dir=args.instance_data_dir,
                                  image_size=args.resolution,
+                                 tokenizer=tokenizer,
                                  center_crop=args.center_crop,
                                  class_image_dir=args.class_data_dir,
                                  class_image_prompts_file=args.class_image_captions_file,
