@@ -2,10 +2,10 @@
 
 MODEL_NAME="stabilityai/stable-diffusion-2-inpainting"
 INSTANCE_DIR="C:\Users\smanjun3\Desktop\FashionXchange\IMAGES"
-OUTPUT_DIR="C:\Users\smanjun3\Desktop\FashionXchange\Output"
+OUTPUT_DIR="C:\Users\smanjun3\Desktop\FashionXchange\Output\accelerator"
 LOGGING_DIR="C:\Users\smanjun3\Desktop\FashionXchange\Logs"
 INSTANCE_CAPTION_FILE="C:\Users\smanjun3\Desktop\FashionXchange\2667_IMAGES_dict.json"
-
+PIPELINE_CHECKPOINTS_OUTPUT_DIR="C:\Users\smanjun3\Desktop\FashionXchange\Output\pipeline"
   
 accelerate launch src/sd_inpainting_finetuning.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
@@ -20,4 +20,6 @@ accelerate launch src/sd_inpainting_finetuning.py \
   --lr_scheduler="constant" \
   --lr_warmup_steps=0 \
   --num_train_epochs=100 \
-  --checkpointing_steps=917
+  --accelerator_state_checkpointing_steps=18340 \
+  --pipeline_checkpoints_output_dir=$PIPELINE_CHECKPOINTS_OUTPUT_DIR  \
+  --pipeline_checkpointing_steps=9170

@@ -266,7 +266,7 @@ def parse_args():
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument(
-        "--checkpointing_steps",
+        "--accelerator_state_checkpointing_steps",
         type=int,
         default=500,
         help=(
@@ -320,7 +320,22 @@ def parse_args():
             "Path to json/yaml/text file containig the text prompts for the class images"
         )
     )
-    
+
+    parser.add_argument(
+        "--pipeline_checkpointing_steps",
+        type=int,
+        default=1000,
+        help=(
+            "The frequency in terms of number of training steps at which the pipeline weights need to be stored"
+        )
+    )
+
+    parser.add_argument(
+        "--pipeline_checkpoints_output_dir",
+        type=str,
+        default=None,
+        help="The output directory where the pipeline weights will be stored",
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -826,11 +841,21 @@ def model_finetuning():
                 progress_bar.update(1)
                 global_step += 1
 
-                if global_step % args.checkpointing_steps == 0:
+                if global_step % args.accelerator_state_checkpointing_steps == 0:
                     if accelerator.is_main_process:
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
+
+            if accelerator.is_main_process and global_step % args.pipeline_checkpointing_steps == 0:
+                pipeline = StableDiffusionPipeline.from_pretrained(
+                    args.pretrained_model_name_or_path,
+                    unet=accelerator.unwrap_model(unet),
+                    text_encoder=accelerator.unwrap_model(text_encoder),
+                )
+                save_folder = os.path.join(os.path.join(args.pipeline_checkpoints_output_dir, f"checkpoint-{global_step}"))
+                os.makedirs(save_folder)
+                pipeline.save_pretrained(save_folder)
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
