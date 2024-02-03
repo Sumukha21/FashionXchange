@@ -38,11 +38,33 @@ from diffusers import (
 from huggingface_hub.utils import insecure_hashlib
 from huggingface_hub import create_repo, upload_folder
 from diffusers.optimization import get_scheduler
-from diffusers.utils import check_min_version
-from src.utils.utils import text_file_reader
+# from src.utils.utils import text_file_reader
 
 
 logger = get_logger(__name__)
+
+
+def text_file_reader(file_path):
+    """
+    Read the contents of a text file.
+    Args:
+        file_path (str): The path to the text file.
+    Returns:
+        list: A list containing the lines of text from the file.
+    """
+    try:
+        with open(file_path, 'r') as file:
+            lines = file.readlines()
+        return lines
+    
+    except FileNotFoundError:
+        print(f"File '{file_path}' not found.")
+        return None
+    except Exception as e:
+        print(f"Error reading file: {e}")
+        return None
+    
+
 
 
 def prepare_mask_and_masked_image(image, mask):
@@ -93,7 +115,7 @@ def parse_args():
         "--pretrained_model_name_or_path",
         type=str,
         default="stabilityai/stable-diffusion-2-inpainting",
-        required=False, #True,
+        required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
@@ -106,19 +128,19 @@ def parse_args():
         "--instance_data_dir",
         type=str,
         default="sample_images",
-        required=False, #True,
+        required=True,
         help="A folder containing the training data of instance images.",
     )
     parser.add_argument(
         "--class_data_dir",
         type=str,
-        default="sample_images", #None,
+        default=None,
         required=False,
         help="A folder containing the training data of class images.",
     )
     parser.add_argument(
         "--with_prior_preservation",
-        default=True, #False,
+        default=False,
         action="store_true",
         help="Flag to add prior preservation loss.",
     )
@@ -135,7 +157,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="delete", #"text-inversion-model",
+        default="text-inversion-model",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
@@ -225,7 +247,7 @@ def parse_args():
     parser.add_argument(
         "--logging_dir",
         type=str,
-        default="./delete/logs", #"logs",
+        default="logs",
         help=(
             "[TensorBoard](https://www.tensorflow.org/tensorboard) log directory. Will default to"
             " *output_dir/runs/**CURRENT_DATETIME_HOSTNAME***."
@@ -273,7 +295,7 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "class_images_generation_prompts_file",
+        "--class_images_generation_prompts_file",
         type=str,
         default=None,
         help=(
@@ -282,7 +304,7 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "instance_image_captions_file",
+        "--instance_image_captions_file",
         type=str,
         default=None,
         required=True,
@@ -291,7 +313,7 @@ def parse_args():
         )    
     )
     parser.add_argument(
-        "class_image_captions_file",
+        "--class_image_captions_file",
         type=str,
         default=None,
         help=(
@@ -412,6 +434,8 @@ class TrainDataset(Dataset):
         example = dict()
         image_name = os.path.basename(self.instance_image_list[idx])
         instance_image = Image.open(self.instance_image_list[idx])
+        if not instance_image.mode == "RGB":
+            instance_image = instance_image.convert("RGB")
         instance_image = self.image_transforms_resize_and_crop(instance_image)
         example["PIL_images"] = instance_image
         example["instance_images"] = self.image_transforms(instance_image)
@@ -424,6 +448,8 @@ class TrainDataset(Dataset):
         if self.class_image_list is not None:
             class_image_name = os.path.basename(self.class_image_list[idx])
             class_image = Image.open(self.class_image_list[idx])
+            if not class_image.mode == "RGB":
+                class_image = class_image.convert("RGB")
             class_image = self.image_transforms_resize_and_crop(class_image)
             example["class_images"] = self.image_transforms(class_image)
             example["class_PIL_images"] = class_image
