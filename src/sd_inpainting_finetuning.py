@@ -63,8 +63,6 @@ def text_file_reader(file_path):
     except Exception as e:
         print(f"Error reading file: {e}")
         return None
-    
-
 
 
 def prepare_mask_and_masked_image(image, mask):
@@ -611,6 +609,20 @@ def model_finetuning():
                                  class_image_dir=args.class_data_dir,
                                  class_image_prompts_file=args.class_image_captions_file,
                                  class_sample_generated_prompts=sample_img_names_prompts)
+
+    def collate_custom(examples):
+        input_ids = [example["instance_prompt_ids"] for example in examples]
+        pixel_values = [example["instance_images"] for example in examples]
+        masked_images = [example["masked_image"] for example in examples]
+        masks = [example["mask"] for example in examples]
+        pixel_values = torch.stack(pixel_values)
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+        input_ids = tokenizer.pad({"input_ids": input_ids}, padding=True, return_tensors="pt").input_ids
+        masks = torch.stack(masks)
+        masked_images = torch.stack(masked_images)
+        batch = {"input_ids": input_ids, "pixel_values": pixel_values, "masks": masks, "masked_images": masked_images}
+        return batch
+
 
     def collate_fn(examples):
         input_ids = [example["instance_prompt_ids"] for example in examples]
