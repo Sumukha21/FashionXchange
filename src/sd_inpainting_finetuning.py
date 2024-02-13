@@ -563,10 +563,141 @@ class TargetedMaskingDataset(Dataset):
             max_length=self.tokenizer.model_max_length,
         ).input_ids
         return example
+
+
+class TargetedMaskingDatasetWithPriorPreservation(Dataset):
+    def __init__(self, 
+                instance_image_captions_file, 
+                instance_image_dir,
+                instance_images_mask_dir, 
+                class_images_dir,
+                class_image_captions_file,
+                tokenizer,
+                image_size=512):
+        self.tokenizer = tokenizer
+        self.instance_image_captions = self.caption_file_reader(instance_image_captions_file)
+        self.mask_directory = instance_images_mask_dir
+        self.instance_image_list = [os.path.join(instance_image_dir, image_file) for image_file in self.instance_image_captions.keys()]
+        self.class_image_captions = self.caption_file_reader(class_image_captions_file)
+        self.class_image_list = [os.path.join(class_images_dir, image_file) for image_file in self.class_image_captions.keys()]
+        if len(self.class_image_list) > len(self.instance_image_list):
+            self.class_image_list = random.sample(self.class_image_list, len(self.instance_image_list) - 1)
+        elif len(self.class_image_list) < len(self.instance_image_list):
+            required_samples_count = len(self.instance_image_list) - len(self.class_image_list)
+            while required_samples_count > 0:
+                if required_samples_count > len(self.class_image_list):
+                    class_image_list = random.sample(self.class_image_list, len(self.class_image_list) - 1)
+                    required_samples_count -= (len(self.class_image_list) - 1)
+                else:
+                    class_image_list = random.sample(self.class_image_list, required_samples_count)
+                    required_samples_count = 0
+                self.class_image_list.extend(class_image_list)
     
+        self.image_transforms_resize_and_crop = transforms.Compose(
+            [
+                transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BILINEAR),
+                transforms.RandomCrop(image_size),
+            ]
+        )
+        
+        self.image_transforms_resize = transforms.Compose(
+            [
+                transforms.Resize((image_size, image_size), interpolation=transforms.InterpolationMode.BILINEAR),
+                # transforms.CenterCrop(image_size)
+            ]
+        )
+        self.image_transforms_resize2 = transforms.Compose(
+            [
+                transforms.Resize((image_size, image_size), interpolation=transforms.InterpolationMode.NEAREST),
+                # transforms.CenterCrop(image_size)
+            ]
+        )
+        self.image_transforms = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5]),
+            ]
+        )
+
+    def __len__(self):
+        return len(self.instance_image_captions)
+
+    @staticmethod
+    def caption_file_reader(captions_file_path, image_directory=None):
+        ext = os.path.splitext(captions_file_path)[1]
+        if captions_file_path.endswith(".txt"):
+            assert image_directory is not None
+            captions = text_file_reader(captions_file_path)
+            image_vs_captions = dict()
+            img_list = glob(os.path.join(image_directory, '*.jpg'))
+            for img_path, caption in zip(img_list, captions):
+                img_name = os.path.basename(img_path)
+                image_vs_captions[img_name] = caption
+            return image_vs_captions
+        elif captions_file_path.endswith(".json"):
+            """
+            Code for creating a dictionary of image_name vs captions by reading a json file 
+            """
+            with open(captions_file_path, "r") as json_file:
+                image_vs_captions = json.load(json_file)
+            return image_vs_captions
+
+        elif captions_file_path.endswith(".yaml"):
+            """
+            Code for creating a dictionary of image_name vs captions by reading a yaml file 
+            """
+            pass
+        elif captions_file_path.endswith(".token"):
+            with open(captions_file_path, 'r', encoding='utf-8') as file:
+                content = file.readlines()
+            image_vs_caption = dict()
+            for line in content:
+                image_name, caption = line.split("\n")[0].split("\t")
+                image_name = image_name.split("#")[0]
+                if image_vs_caption.get(image_name):
+                    continue
+                image_vs_caption[image_name] = caption
+            return image_vs_caption
+    
+    def __getitem__(self, idx):
+        example = dict()
+        image_name = os.path.basename(self.instance_image_list[idx])
+        instance_image = Image.open(self.instance_image_list[idx])
+        mask_paths = os.listdir(os.path.join(self.mask_directory, image_name.split(".")[0]))
+        if not instance_image.mode == "RGB":
+            instance_image = instance_image.convert("RGB")
+        random_selector = np.random.randint(0, len(mask_paths))
+        # print(mask_paths[random_selector])
+        selected_mask = Image.open(os.path.join(self.mask_directory, os.path.join(image_name.split(".jpg")[0], mask_paths[random_selector])))
+        example["mask"] = self.image_transforms_resize2(selected_mask)
+        instance_image = self.image_transforms_resize(instance_image)
+        example["PIL_image"] = instance_image
+        example["instance_image"] = self.image_transforms(instance_image)
+        example["instance_prompt_ids"] = self.tokenizer(
+            self.instance_image_captions[image_name],
+            padding="do_not_pad",
+            truncation=True,
+            max_length=self.tokenizer.model_max_length,
+        ).input_ids
+        class_image_name = os.path.basename(self.class_image_list[idx])
+        class_image = Image.open(self.class_image_list[idx])
+        if not class_image.mode == "RGB":
+                class_image = class_image.convert("RGB")
+        class_image = self.image_transforms_resize_and_crop(class_image)
+        example["class_images"] = self.image_transforms(class_image)
+        example["class_PIL_images"] = class_image
+        example["class_prompt_ids"] = self.tokenizer(
+            self.class_image_captions[class_image_name],
+            padding="do_not_pad",
+            truncation=True,
+            max_length=self.tokenizer.model_max_length,
+        ).input_ids
+        return example
+          
 
 def random_perturb_mask(mask):
     ones = np.where(mask > 0)
+    mask[mask > 0] = 1
     y_max, y_min, x_max, x_min = max(ones[0]), min(ones[0]), max(ones[1]), min(ones[1])
     increase_or_decrease = [0, 1]
     up_down_left_right = [0, 1, 2, 3]
@@ -599,7 +730,7 @@ def random_perturb_mask(mask):
             mask[y_min: y_max + 1, x_min: x_min + increase_or_decrease_quantity] = False
         else:
             mask[y_min: y_max + 1, x_max - increase_or_decrease_quantity: x_max] = False
-    return mask            
+    return mask
 
 
 def model_finetuning():
@@ -781,6 +912,55 @@ def model_finetuning():
             masked_images = torch.stack(masked_images)
             batch = {"input_ids": input_ids, "pixel_values": pixel_values, "masks": masks, "masked_images": masked_images}
             return batch
+    
+    elif args.instance_images_mask_dir is not None and args.with_prior_preservation:
+        train_dataset = TargetedMaskingDatasetWithPriorPreservation(
+                                                                    instance_image_captions_file=args.instance_image_captions_file, 
+                                                                    instance_image_dir=args.instance_data_dir,
+                                                                    instance_images_mask_dir=args.instance_images_mask_dir, 
+                                                                    class_images_dir=args.class_data_dir,
+                                                                    class_image_captions_file=args.class_image_captions_file,
+                                                                    tokenizer=tokenizer,
+                                                                    image_size=512
+                                                                    )
+        
+        def collate_fn(examples):
+            input_ids = [example["instance_prompt_ids"] for example in examples]
+            pixel_values = [example["instance_image"] for example in examples]
+            input_ids += [example["class_prompt_ids"] for example in examples]
+            pixel_values += [example["class_images"] for example in examples]
+            pior_pil = [example["class_PIL_images"] for example in examples]
+            masks = []
+            masked_images = []
+            for example in examples:
+                pil_image = np.array(example["PIL_image"])
+                mask = np.array(example["mask"])
+                mask = random_perturb_mask(mask)
+                image = torch.from_numpy(pil_image).to(dtype=torch.float32) / 127.5 - 1.0
+                mask = torch.from_numpy(mask)
+                mask = mask.unsqueeze(2)
+                masked_image = image * (mask.expand(-1, -1, 3) == 0)
+                masked_image = masked_image.permute(2, 0, 1)
+                mask = mask.permute(2, 0, 1)
+                masks.append(mask)
+                masked_images.append(masked_image)
+            
+            for pil_image in pior_pil:
+                # generate a random mask
+                mask = random_mask(pil_image.size, 1, False)
+                # prepare mask and masked image
+                mask, masked_image = prepare_mask_and_masked_image(pil_image, mask)
+
+                masks.append(mask[0])
+                masked_images.append(masked_image[0])
+
+            pixel_values = torch.stack(pixel_values)
+            pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+            input_ids = tokenizer.pad({"input_ids": input_ids}, padding=True, return_tensors="pt").input_ids
+            masks = torch.stack(masks)
+            masked_images = torch.stack(masked_images)
+            batch = {"input_ids": input_ids, "pixel_values": pixel_values, "masks": masks, "masked_images": masked_images}
+            return batch    
 
     else:
         train_dataset = TargetedMaskingDataset(instance_image_captions_file=args.instance_image_captions_file, 
