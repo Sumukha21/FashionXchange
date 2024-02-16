@@ -354,8 +354,8 @@ def parse_args():
     if args.with_prior_preservation:
         if args.class_data_dir is None:
             raise ValueError("You must specify a data directory for class images.")
-        if args.class_prompt is None:
-            raise ValueError("You must specify prompt for class images.")
+        # if args.class_prompt is None:
+        #     raise ValueError("You must specify prompt for class images.")
 
     return args
 
@@ -577,17 +577,22 @@ class TargetedMaskingDatasetWithPriorPreservation(Dataset):
         self.tokenizer = tokenizer
         self.instance_image_captions = self.caption_file_reader(instance_image_captions_file)
         self.mask_directory = instance_images_mask_dir
-        self.instance_image_list = [os.path.join(instance_image_dir, image_file) for image_file in self.instance_image_captions.keys()]
+        self.instance_images_mask_list = os.listdir(self.mask_directory)
+        self.instance_image_captions_updated = dict()
+        for i in self.instance_images_mask_list:
+            self.instance_image_captions_updated[i] = self.instance_image_captions[i]
+        self.instance_image_captions = self.instance_image_captions_updated
+        self.instance_image_list = [os.path.join(instance_image_dir, image_file + '.jpg') for image_file in self.instance_image_captions.keys()]
         self.class_image_captions = self.caption_file_reader(class_image_captions_file)
         self.class_image_list = [os.path.join(class_images_dir, image_file) for image_file in self.class_image_captions.keys()]
         if len(self.class_image_list) > len(self.instance_image_list):
-            self.class_image_list = random.sample(self.class_image_list, len(self.instance_image_list) - 1)
+            self.class_image_list = random.sample(self.class_image_list, len(self.instance_image_list))
         elif len(self.class_image_list) < len(self.instance_image_list):
             required_samples_count = len(self.instance_image_list) - len(self.class_image_list)
             while required_samples_count > 0:
                 if required_samples_count > len(self.class_image_list):
-                    class_image_list = random.sample(self.class_image_list, len(self.class_image_list) - 1)
-                    required_samples_count -= (len(self.class_image_list) - 1)
+                    class_image_list = random.sample(self.class_image_list, len(self.class_image_list))
+                    required_samples_count -= (len(self.class_image_list))
                 else:
                     class_image_list = random.sample(self.class_image_list, required_samples_count)
                     required_samples_count = 0
@@ -674,7 +679,7 @@ class TargetedMaskingDatasetWithPriorPreservation(Dataset):
         example["PIL_image"] = instance_image
         example["instance_image"] = self.image_transforms(instance_image)
         example["instance_prompt_ids"] = self.tokenizer(
-            self.instance_image_captions[image_name],
+            self.instance_image_captions[image_name.strip('.jpg')],
             padding="do_not_pad",
             truncation=True,
             max_length=self.tokenizer.model_max_length,
@@ -914,6 +919,7 @@ def model_finetuning():
             return batch
     
     elif args.instance_images_mask_dir is not None and args.with_prior_preservation:
+        print("Inside Traget Masking Dataset with prior loss")
         train_dataset = TargetedMaskingDatasetWithPriorPreservation(
                                                                     instance_image_captions_file=args.instance_image_captions_file, 
                                                                     instance_image_dir=args.instance_data_dir,
