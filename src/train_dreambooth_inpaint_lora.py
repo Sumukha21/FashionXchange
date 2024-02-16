@@ -3,7 +3,7 @@ import math
 import os
 import random
 from pathlib import Path
-
+import enum
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -27,6 +27,7 @@ from diffusers.utils import check_min_version
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 from diffusers.loaders import LoraLoaderMixin
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 from peft import LoraConfig
 from peft.utils import get_peft_model_state_dict, set_peft_model_state_dict
@@ -164,6 +165,38 @@ KOHYA_STATE_DICT_MAPPINGS = {StateDictType.PEFT: PEFT_TO_KOHYA_SS}
 KEYS_TO_ALWAYS_REPLACE = {
     ".processor.": ".",
 }
+
+def convert_state_dict(state_dict, mapping):
+    r"""
+    Simply iterates over the state dict and replaces the patterns in `mapping` with the corresponding values.
+
+    Args:
+        state_dict (`dict[str, torch.Tensor]`):
+            The state dict to convert.
+        mapping (`dict[str, str]`):
+            The mapping to use for conversion, the mapping should be a dictionary with the following structure:
+                - key: the pattern to replace
+                - value: the pattern to replace with
+
+    Returns:
+        converted_state_dict (`dict`)
+            The converted state dict.
+    """
+    converted_state_dict = {}
+    for k, v in state_dict.items():
+        # First, filter out the keys that we always want to replace
+        for pattern in KEYS_TO_ALWAYS_REPLACE.keys():
+            if pattern in k:
+                new_pattern = KEYS_TO_ALWAYS_REPLACE[pattern]
+                k = k.replace(pattern, new_pattern)
+
+        for pattern in mapping.keys():
+            if pattern in k:
+                new_pattern = mapping[pattern]
+                k = k.replace(pattern, new_pattern)
+                break
+        converted_state_dict[k] = v
+    return converted_state_dict
 
 
 
