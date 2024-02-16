@@ -559,6 +559,21 @@ def parse_args():
         default=4,
         help=("The dimension of the LoRA update matrices."),
     )
+    parser.add_argument(
+        "--pipeline_checkpointing_steps",
+        type=int,
+        default=1000,
+        help=(
+            "The frequency in terms of number of training steps at which the pipeline weights need to be stored"
+        )
+    )
+
+    parser.add_argument(
+        "--pipeline_checkpoints_output_dir",
+        type=str,
+        default=None,
+        help="The output directory where the pipeline weights will be stored",
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -1426,6 +1441,24 @@ def main():
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
+           
+            if accelerator.is_main_process and global_step % args.pipeline_checkpointing_steps == 0:
+                unet = unwrap_model(unet)
+                unet = unet.to(torch.float32)
+
+                unet_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unet))
+
+                if args.train_text_encoder:
+                    text_encoder = unwrap_model(text_encoder)
+                    text_encoder_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(text_encoder))
+                else:
+                    text_encoder_state_dict = None
+
+                LoraLoaderMixin.save_lora_weights(
+                    save_directory=args.output_dir,
+                    unet_lora_layers=unet_lora_state_dict,
+                    text_encoder_lora_layers=text_encoder_state_dict,
+                )
 
             if global_step >= args.max_train_steps:
                 break
@@ -1444,24 +1477,6 @@ def main():
     #             commit_message="End of training",
     #             ignore_patterns=["step_*", "epoch_*"],
     #         )
-    if accelerator.is_main_process:
-        unet = unwrap_model(unet)
-        unet = unet.to(torch.float32)
-
-        unet_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unet))
-
-        if args.train_text_encoder:
-            text_encoder = unwrap_model(text_encoder)
-            text_encoder_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(text_encoder))
-        else:
-            text_encoder_state_dict = None
-
-        LoraLoaderMixin.save_lora_weights(
-            save_directory=args.output_dir,
-            unet_lora_layers=unet_lora_state_dict,
-            text_encoder_lora_layers=text_encoder_state_dict,
-        )
-
     accelerator.end_training()
 
 
