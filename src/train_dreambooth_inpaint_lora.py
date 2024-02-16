@@ -25,6 +25,8 @@ from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionInpaintPipeli
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
 from diffusers.utils.import_utils import is_xformers_available
+from diffusers.utils.torch_utils import is_compiled_module
+from diffusers.loaders import LoraLoaderMixin
 
 from peft import LoraConfig
 from peft.utils import get_peft_model_state_dict, set_peft_model_state_dict
@@ -35,6 +37,245 @@ from peft.utils import get_peft_model_state_dict, set_peft_model_state_dict
 check_min_version("0.13.0.dev0")
 
 logger = get_logger(__name__)
+
+def text_file_reader(file_path):
+    """
+    Read the contents of a text file.
+    Args:
+        file_path (str): The path to the text file.
+    Returns:
+        list: A list containing the lines of text from the file.
+    """
+    try:
+        with open(file_path, 'r') as file:
+            lines = file.readlines()
+        return lines
+    
+    except FileNotFoundError:
+        print(f"File '{file_path}' not found.")
+        return None
+    except Exception as e:
+        print(f"Error reading file: {e}")
+        return None
+
+class StateDictType(enum.Enum):
+    """
+    The mode to use when converting state dicts.
+    """
+
+    DIFFUSERS_OLD = "diffusers_old"
+    KOHYA_SS = "kohya_ss"
+    PEFT = "peft"
+    DIFFUSERS = "diffusers"
+
+
+# We need to define a proper mapping for Unet since it uses different output keys than text encoder
+# e.g. to_q_lora -> q_proj / to_q
+UNET_TO_DIFFUSERS = {
+    ".to_out_lora.up": ".to_out.0.lora_B",
+    ".to_out_lora.down": ".to_out.0.lora_A",
+    ".to_q_lora.down": ".to_q.lora_A",
+    ".to_q_lora.up": ".to_q.lora_B",
+    ".to_k_lora.down": ".to_k.lora_A",
+    ".to_k_lora.up": ".to_k.lora_B",
+    ".to_v_lora.down": ".to_v.lora_A",
+    ".to_v_lora.up": ".to_v.lora_B",
+    ".lora.up": ".lora_B",
+    ".lora.down": ".lora_A",
+}
+
+
+DIFFUSERS_TO_PEFT = {
+    ".q_proj.lora_linear_layer.up": ".q_proj.lora_B",
+    ".q_proj.lora_linear_layer.down": ".q_proj.lora_A",
+    ".k_proj.lora_linear_layer.up": ".k_proj.lora_B",
+    ".k_proj.lora_linear_layer.down": ".k_proj.lora_A",
+    ".v_proj.lora_linear_layer.up": ".v_proj.lora_B",
+    ".v_proj.lora_linear_layer.down": ".v_proj.lora_A",
+    ".out_proj.lora_linear_layer.up": ".out_proj.lora_B",
+    ".out_proj.lora_linear_layer.down": ".out_proj.lora_A",
+    ".lora_linear_layer.up": ".lora_B",
+    ".lora_linear_layer.down": ".lora_A",
+}
+
+DIFFUSERS_OLD_TO_PEFT = {
+    ".to_q_lora.up": ".q_proj.lora_B",
+    ".to_q_lora.down": ".q_proj.lora_A",
+    ".to_k_lora.up": ".k_proj.lora_B",
+    ".to_k_lora.down": ".k_proj.lora_A",
+    ".to_v_lora.up": ".v_proj.lora_B",
+    ".to_v_lora.down": ".v_proj.lora_A",
+    ".to_out_lora.up": ".out_proj.lora_B",
+    ".to_out_lora.down": ".out_proj.lora_A",
+    ".lora_linear_layer.up": ".lora_B",
+    ".lora_linear_layer.down": ".lora_A",
+}
+
+PEFT_TO_DIFFUSERS = {
+    ".q_proj.lora_B": ".q_proj.lora_linear_layer.up",
+    ".q_proj.lora_A": ".q_proj.lora_linear_layer.down",
+    ".k_proj.lora_B": ".k_proj.lora_linear_layer.up",
+    ".k_proj.lora_A": ".k_proj.lora_linear_layer.down",
+    ".v_proj.lora_B": ".v_proj.lora_linear_layer.up",
+    ".v_proj.lora_A": ".v_proj.lora_linear_layer.down",
+    ".out_proj.lora_B": ".out_proj.lora_linear_layer.up",
+    ".out_proj.lora_A": ".out_proj.lora_linear_layer.down",
+    "to_k.lora_A": "to_k.lora.down",
+    "to_k.lora_B": "to_k.lora.up",
+    "to_q.lora_A": "to_q.lora.down",
+    "to_q.lora_B": "to_q.lora.up",
+    "to_v.lora_A": "to_v.lora.down",
+    "to_v.lora_B": "to_v.lora.up",
+    "to_out.0.lora_A": "to_out.0.lora.down",
+    "to_out.0.lora_B": "to_out.0.lora.up",
+}
+
+DIFFUSERS_OLD_TO_DIFFUSERS = {
+    ".to_q_lora.up": ".q_proj.lora_linear_layer.up",
+    ".to_q_lora.down": ".q_proj.lora_linear_layer.down",
+    ".to_k_lora.up": ".k_proj.lora_linear_layer.up",
+    ".to_k_lora.down": ".k_proj.lora_linear_layer.down",
+    ".to_v_lora.up": ".v_proj.lora_linear_layer.up",
+    ".to_v_lora.down": ".v_proj.lora_linear_layer.down",
+    ".to_out_lora.up": ".out_proj.lora_linear_layer.up",
+    ".to_out_lora.down": ".out_proj.lora_linear_layer.down",
+}
+
+PEFT_TO_KOHYA_SS = {
+    "lora_A": "lora_down",
+    "lora_B": "lora_up",
+    # This is not a comprehensive dict as kohya format requires replacing `.` with `_` in keys,
+    # adding prefixes and adding alpha values
+    # Check `convert_state_dict_to_kohya` for more
+}
+
+PEFT_STATE_DICT_MAPPINGS = {
+    StateDictType.DIFFUSERS_OLD: DIFFUSERS_OLD_TO_PEFT,
+    StateDictType.DIFFUSERS: DIFFUSERS_TO_PEFT,
+}
+
+DIFFUSERS_STATE_DICT_MAPPINGS = {
+    StateDictType.DIFFUSERS_OLD: DIFFUSERS_OLD_TO_DIFFUSERS,
+    StateDictType.PEFT: PEFT_TO_DIFFUSERS,
+}
+
+KOHYA_STATE_DICT_MAPPINGS = {StateDictType.PEFT: PEFT_TO_KOHYA_SS}
+
+KEYS_TO_ALWAYS_REPLACE = {
+    ".processor.": ".",
+}
+
+
+
+def convert_unet_state_dict_to_peft(state_dict):
+    r"""
+    Converts a state dict from UNet format to diffusers format - i.e. by removing some keys
+    """
+    mapping = UNET_TO_DIFFUSERS
+    return convert_state_dict(state_dict, mapping)
+
+
+def convert_state_dict_to_peft(state_dict, original_type=None, **kwargs):
+    r"""
+    Converts a state dict to the PEFT format The state dict can be from previous diffusers format (`OLD_DIFFUSERS`), or
+    new diffusers format (`DIFFUSERS`). The method only supports the conversion from diffusers old/new to PEFT for now.
+
+    Args:
+        state_dict (`dict[str, torch.Tensor]`):
+            The state dict to convert.
+        original_type (`StateDictType`, *optional*):
+            The original type of the state dict, if not provided, the method will try to infer it automatically.
+    """
+    if original_type is None:
+        # Old diffusers to PEFT
+        if any("to_out_lora" in k for k in state_dict.keys()):
+            original_type = StateDictType.DIFFUSERS_OLD
+        elif any("lora_linear_layer" in k for k in state_dict.keys()):
+            original_type = StateDictType.DIFFUSERS
+        else:
+            raise ValueError("Could not automatically infer state dict type")
+
+    if original_type not in PEFT_STATE_DICT_MAPPINGS.keys():
+        raise ValueError(f"Original type {original_type} is not supported")
+
+    mapping = PEFT_STATE_DICT_MAPPINGS[original_type]
+    return convert_state_dict(state_dict, mapping)
+
+
+def convert_state_dict_to_diffusers(state_dict, original_type=None, **kwargs):
+    r"""
+    Converts a state dict to new diffusers format. The state dict can be from previous diffusers format
+    (`OLD_DIFFUSERS`), or PEFT format (`PEFT`) or new diffusers format (`DIFFUSERS`). In the last case the method will
+    return the state dict as is.
+
+    The method only supports the conversion from diffusers old, PEFT to diffusers new for now.
+
+    Args:
+        state_dict (`dict[str, torch.Tensor]`):
+            The state dict to convert.
+        original_type (`StateDictType`, *optional*):
+            The original type of the state dict, if not provided, the method will try to infer it automatically.
+        kwargs (`dict`, *args*):
+            Additional arguments to pass to the method.
+
+            - **adapter_name**: For example, in case of PEFT, some keys will be pre-pended
+                with the adapter name, therefore needs a special handling. By default PEFT also takes care of that in
+                `get_peft_model_state_dict` method:
+                https://github.com/huggingface/peft/blob/ba0477f2985b1ba311b83459d29895c809404e99/src/peft/utils/save_and_load.py#L92
+                but we add it here in case we don't want to rely on that method.
+    """
+    peft_adapter_name = kwargs.pop("adapter_name", None)
+    if peft_adapter_name is not None:
+        peft_adapter_name = "." + peft_adapter_name
+    else:
+        peft_adapter_name = ""
+
+    if original_type is None:
+        # Old diffusers to PEFT
+        if any("to_out_lora" in k for k in state_dict.keys()):
+            original_type = StateDictType.DIFFUSERS_OLD
+        elif any(f".lora_A{peft_adapter_name}.weight" in k for k in state_dict.keys()):
+            original_type = StateDictType.PEFT
+        elif any("lora_linear_layer" in k for k in state_dict.keys()):
+            # nothing to do
+            return state_dict
+        else:
+            raise ValueError("Could not automatically infer state dict type")
+
+    if original_type not in DIFFUSERS_STATE_DICT_MAPPINGS.keys():
+        raise ValueError(f"Original type {original_type} is not supported")
+
+    mapping = DIFFUSERS_STATE_DICT_MAPPINGS[original_type]
+    return convert_state_dict(state_dict, mapping)
+
+
+def cast_training_params(model: Union[torch.nn.Module, List[torch.nn.Module]], dtype=torch.float32):
+    if not isinstance(model, list):
+        model = [model]
+    for m in model:
+        for param in m.parameters():
+            # only upcast trainable parameters into fp32
+            if param.requires_grad:
+                param.data = param.to(dtype)
+
+
+def _set_state_dict_into_text_encoder(
+    lora_state_dict: Dict[str, torch.Tensor], prefix: str, text_encoder: torch.nn.Module
+):
+    """
+    Sets the `lora_state_dict` into `text_encoder` coming from `transformers`.
+
+    Args:
+        lora_state_dict: The state dictionary to be set.
+        prefix: String identifier to retrieve the portion of the state dict that belongs to `text_encoder`.
+        text_encoder: Where the `lora_state_dict` is to be set.
+    """
+
+    text_encoder_state_dict = {
+        f'{k.replace(prefix, "")}': v for k, v in lora_state_dict.items() if k.startswith(prefix)
+    }
+    text_encoder_state_dict = convert_state_dict_to_peft(convert_state_dict_to_diffusers(text_encoder_state_dict))
+    set_peft_model_state_dict(text_encoder, text_encoder_state_dict, adapter_name="default")
 
 
 def prepare_mask_and_masked_image(image, mask):
@@ -391,6 +632,7 @@ class DreamBoothDataset(Dataset):
             ).input_ids
 
         return example
+
 class TargetedMaskingDatasetWithPriorPreservation(Dataset):
     def __init__(self,
                 instance_image_captions_file,
@@ -519,6 +761,44 @@ class TargetedMaskingDatasetWithPriorPreservation(Dataset):
             max_length=self.tokenizer.model_max_length,
         ).input_ids
         return example
+
+
+def random_perturb_mask(mask):
+    ones = np.where(mask > 0)
+    mask[mask > 0] = 1
+    y_max, y_min, x_max, x_min = max(ones[0]), min(ones[0]), max(ones[1]), min(ones[1])
+    increase_or_decrease = [0, 1]
+    up_down_left_right = [0, 1, 2, 3]
+    choice_increase_or_decrease = np.random.choice(increase_or_decrease)
+    choice_udlr = np.random.choice(up_down_left_right)
+    if choice_udlr == 0 or choice_udlr == 1:
+        increase_or_decrease_quantity = np.random.randint(50, 100)
+    elif choice_udlr == 2 or choice_udlr == 3:
+        increase_or_decrease_quantity = np.random.randint(50, 100)
+    # print(choice_increase_or_decrease, choice_udlr, increase_or_decrease_quantity)
+    if choice_increase_or_decrease == 0:
+        if choice_udlr == 0:
+            increase_or_decrease_quantity = min(increase_or_decrease_quantity, y_min)
+            mask[y_min - increase_or_decrease_quantity: y_min + (y_max - y_min) // 6, x_min: x_max + 1] = True
+        elif choice_udlr == 1:
+            increase_or_decrease_quantity = min(increase_or_decrease_quantity, mask.shape[0] - y_max)
+            mask[y_max - (y_max - y_min) // 6: y_max + increase_or_decrease_quantity, x_min: x_max + 1] = True
+        elif choice_udlr == 2:
+            increase_or_decrease_quantity = min(x_min, increase_or_decrease_quantity)
+            mask[y_min: y_max + 1, x_min - increase_or_decrease_quantity: x_min + (x_max - x_min) // 4] = True
+        else:
+            increase_or_decrease_quantity = min(mask.shape[1] - x_max, increase_or_decrease_quantity)
+            mask[y_min: y_max + 1, x_max - (x_max - x_min) // 4: x_max + increase_or_decrease_quantity] = True
+    elif choice_increase_or_decrease == 1:
+        if choice_udlr == 0:
+            mask[y_min: y_min + increase_or_decrease_quantity, x_min: x_max + 1] = False
+        elif choice_udlr == 1:
+            mask[y_max: y_max - increase_or_decrease_quantity, x_min: x_max + 1] = False
+        elif choice_udlr == 2:
+            mask[y_min: y_max + 1, x_min: x_min + increase_or_decrease_quantity] = False
+        else:
+            mask[y_min: y_max + 1, x_max - increase_or_decrease_quantity: x_max] = False
+    return mask
 
 
 
@@ -705,7 +985,83 @@ def main():
         )
         text_encoder.add_adapter(text_lora_config)
 
+    def unwrap_model(model):
+        model = accelerator.unwrap_model(model)
+        model = model._orig_mod if is_compiled_module(model) else model
+        return model
 
+
+    def save_model_hook(models, weights, output_dir):
+        if accelerator.is_main_process:
+            # there are only two options here. Either are just the unet attn processor layers
+            # or there are the unet and text encoder atten layers
+            unet_lora_layers_to_save = None
+            text_encoder_lora_layers_to_save = None
+
+            for model in models:
+                if isinstance(model, type(unwrap_model(unet))):
+                    unet_lora_layers_to_save = convert_state_dict_to_diffusers(get_peft_model_state_dict(model))
+                elif isinstance(model, type(unwrap_model(text_encoder))):
+                    text_encoder_lora_layers_to_save = convert_state_dict_to_diffusers(
+                        get_peft_model_state_dict(model)
+                    )
+                else:
+                    raise ValueError(f"unexpected save model: {model.__class__}")
+
+                # make sure to pop weight so that corresponding model is not saved again
+                weights.pop()
+
+            LoraLoaderMixin.save_lora_weights(
+                output_dir,
+                unet_lora_layers=unet_lora_layers_to_save,
+                text_encoder_lora_layers=text_encoder_lora_layers_to_save,
+            )
+
+    def load_model_hook(models, input_dir):
+        unet_ = None
+        text_encoder_ = None
+
+        while len(models) > 0:
+            model = models.pop()
+
+            if isinstance(model, type(unwrap_model(unet))):
+                unet_ = model
+            elif isinstance(model, type(unwrap_model(text_encoder))):
+                text_encoder_ = model
+            else:
+                raise ValueError(f"unexpected save model: {model.__class__}")
+
+        lora_state_dict, network_alphas = LoraLoaderMixin.lora_state_dict(input_dir)
+
+        unet_state_dict = {f'{k.replace("unet.", "")}': v for k, v in lora_state_dict.items() if k.startswith("unet.")}
+        unet_state_dict = convert_unet_state_dict_to_peft(unet_state_dict)
+        incompatible_keys = set_peft_model_state_dict(unet_, unet_state_dict, adapter_name="default")
+
+        if incompatible_keys is not None:
+            # check only for unexpected keys
+            unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
+            if unexpected_keys:
+                logger.warning(
+                    f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
+                    f" {unexpected_keys}. "
+                )
+
+        if args.train_text_encoder:
+            _set_state_dict_into_text_encoder(lora_state_dict, prefix="text_encoder.", text_encoder=text_encoder_)
+
+        # Make sure the trainable params are in float32. This is again needed since the base models
+        # are in `weight_dtype`. More details:
+        # https://github.com/huggingface/diffusers/pull/6514#discussion_r1449796804
+        if args.mixed_precision == "fp16":
+            models = [unet_]
+            if args.train_text_encoder:
+                models.append(text_encoder_)
+
+            # only upcast trainable parameters (LoRA) into fp32
+            cast_training_params(models, dtype=torch.float32)
+
+    accelerator.register_save_state_pre_hook(save_model_hook)
+    accelerator.register_load_state_pre_hook(load_model_hook)
 
 
     if args.scale_lr:
@@ -749,41 +1105,32 @@ def main():
 
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
-    train_dataset = DreamBoothDataset(
-        instance_data_root=args.instance_data_dir,
-        instance_prompt=args.instance_prompt,
-        class_data_root=args.class_data_dir if args.with_prior_preservation else None,
-        class_prompt=args.class_prompt,
-        tokenizer=tokenizer,
-        size=args.resolution,
-        center_crop=args.center_crop,
-    )
+    if args.instance_images_mask_dir is None:
+        train_dataset = DreamBoothDataset(
+            instance_data_root=args.instance_data_dir,
+            instance_prompt=args.instance_prompt,
+            class_data_root=args.class_data_dir if args.with_prior_preservation else None,
+            class_prompt=args.class_prompt,
+            tokenizer=tokenizer,
+            size=args.resolution,
+            center_crop=args.center_crop,
+        )
 
-    def collate_fn(examples):
-        input_ids = [example["instance_prompt_ids"] for example in examples]
-        pixel_values = [example["instance_images"] for example in examples]
+        def collate_fn(examples):
+            input_ids = [example["instance_prompt_ids"] for example in examples]
+            pixel_values = [example["instance_images"] for example in examples]
 
-        # Concat class and instance examples for prior preservation.
-        # We do this to avoid doing two forward passes.
-        if args.with_prior_preservation:
-            input_ids += [example["class_prompt_ids"] for example in examples]
-            pixel_values += [example["class_images"] for example in examples]
-            pior_pil = [example["class_PIL_images"] for example in examples]
+            # Concat class and instance examples for prior preservation.
+            # We do this to avoid doing two forward passes.
+            if args.with_prior_preservation:
+                input_ids += [example["class_prompt_ids"] for example in examples]
+                pixel_values += [example["class_images"] for example in examples]
+                pior_pil = [example["class_PIL_images"] for example in examples]
 
-        masks = []
-        masked_images = []
-        for example in examples:
-            pil_image = example["PIL_images"]
-            # generate a random mask
-            mask = random_mask(pil_image.size, 1, False)
-            # prepare mask and masked image
-            mask, masked_image = prepare_mask_and_masked_image(pil_image, mask)
-
-            masks.append(mask)
-            masked_images.append(masked_image)
-
-        if args.with_prior_preservation:
-            for pil_image in pior_pil:
+            masks = []
+            masked_images = []
+            for example in examples:
+                pil_image = example["PIL_images"]
                 # generate a random mask
                 mask = random_mask(pil_image.size, 1, False)
                 # prepare mask and masked image
@@ -792,14 +1139,73 @@ def main():
                 masks.append(mask)
                 masked_images.append(masked_image)
 
-        pixel_values = torch.stack(pixel_values)
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+            if args.with_prior_preservation:
+                for pil_image in pior_pil:
+                    # generate a random mask
+                    mask = random_mask(pil_image.size, 1, False)
+                    # prepare mask and masked image
+                    mask, masked_image = prepare_mask_and_masked_image(pil_image, mask)
 
-        input_ids = tokenizer.pad({"input_ids": input_ids}, padding=True, return_tensors="pt").input_ids
-        masks = torch.stack(masks)
-        masked_images = torch.stack(masked_images)
-        batch = {"input_ids": input_ids, "pixel_values": pixel_values, "masks": masks, "masked_images": masked_images}
-        return batch
+                    masks.append(mask)
+                    masked_images.append(masked_image)
+
+            pixel_values = torch.stack(pixel_values)
+            pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+
+            input_ids = tokenizer.pad({"input_ids": input_ids}, padding=True, return_tensors="pt").input_ids
+            masks = torch.stack(masks)
+            masked_images = torch.stack(masked_images)
+            batch = {"input_ids": input_ids, "pixel_values": pixel_values, "masks": masks, "masked_images": masked_images}
+            return batch
+    elif args.instance_images_mask_dir is not None and args.with_prior_preservation:
+        print("Inside Traget Masking Dataset with prior loss")
+        train_dataset = TargetedMaskingDatasetWithPriorPreservation(
+                                                                    instance_image_captions_file=args.instance_image_captions_file, 
+                                                                    instance_image_dir=args.instance_data_dir,
+                                                                    instance_images_mask_dir=args.instance_images_mask_dir, 
+                                                                    class_images_dir=args.class_data_dir,
+                                                                    class_image_captions_file=args.class_image_captions_file,
+                                                                    tokenizer=tokenizer,
+                                                                    image_size=512
+                                                                    )
+        
+        def collate_fn(examples):
+            input_ids = [example["instance_prompt_ids"] for example in examples]
+            pixel_values = [example["instance_image"] for example in examples]
+            input_ids += [example["class_prompt_ids"] for example in examples]
+            pixel_values += [example["class_images"] for example in examples]
+            pior_pil = [example["class_PIL_images"] for example in examples]
+            masks = []
+            masked_images = []
+            for example in examples:
+                pil_image = np.array(example["PIL_image"])
+                mask = np.array(example["mask"])
+                mask = random_perturb_mask(mask)
+                image = torch.from_numpy(pil_image).to(dtype=torch.float32) / 127.5 - 1.0
+                mask = torch.from_numpy(mask)
+                mask = mask.unsqueeze(2)
+                masked_image = image * (mask.expand(-1, -1, 3) == 0)
+                masked_image = masked_image.permute(2, 0, 1)
+                mask = mask.permute(2, 0, 1)
+                masks.append(mask)
+                masked_images.append(masked_image)
+            
+            for pil_image in pior_pil:
+                # generate a random mask
+                mask = random_mask(pil_image.size, 1, False)
+                # prepare mask and masked image
+                mask, masked_image = prepare_mask_and_masked_image(pil_image, mask)
+
+                masks.append(mask[0])
+                masked_images.append(masked_image[0])
+
+            pixel_values = torch.stack(pixel_values)
+            pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+            input_ids = tokenizer.pad({"input_ids": input_ids}, padding=True, return_tensors="pt").input_ids
+            masks = torch.stack(masks)
+            masked_images = torch.stack(masked_images)
+            batch = {"input_ids": input_ids, "pixel_values": pixel_values, "masks": masks, "masked_images": masked_images}
+            return batch    
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.train_batch_size, shuffle=True, collate_fn=collate_fn
