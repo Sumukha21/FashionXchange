@@ -6,6 +6,7 @@ from pathlib import Path
 import enum
 import numpy as np
 import torch
+import json
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from accelerate import Accelerator
@@ -382,18 +383,7 @@ def parse_args():
         required=False,
         help="A folder containing the training data of class images.",
     )
-    parser.add_argument(
-        "--instance_prompt",
-        type=str,
-        default=None,
-        help="The prompt with identifier specifying the instance",
-    )
-    parser.add_argument(
-        "--class_prompt",
-        type=str,
-        default=None,
-        help="The prompt to specify images in the same class as provided instance images.",
-    )
+  
     parser.add_argument(
         "--with_prior_preservation",
         default=False,
@@ -575,6 +565,34 @@ def parse_args():
         help="The output directory where the pipeline weights will be stored",
     )
 
+
+    parser.add_argument(
+        "--class_image_captions_file",
+        type=str,
+        default=None,
+        help=(
+            "Path to json/yaml/text file containig the text prompts for the class images"
+        )
+    )
+
+    parser.add_argument(
+        "--instance_image_captions_file",
+        type=str,
+        default=r"C:\Users\smanjun3\Desktop\FashionXchange\text2human\masked_image_captions.json",
+        required=False, #True,
+        help=(
+            "Path to json/yaml/text file containig the text prompts for the instance images"
+        )    
+    )
+
+    parser.add_argument(
+        "--instance_images_mask_dir",
+        type=str,
+        default=r"C:\Users\smanjun3\Desktop\FashionXchange\text2human\Masks",
+        help="The directory where the instance image masks are stored",
+    )
+    
+
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -586,8 +604,8 @@ def parse_args():
     if args.with_prior_preservation:
         if args.class_data_dir is None:
             raise ValueError("You must specify a data directory for class images.")
-        if args.class_prompt is None:
-            raise ValueError("You must specify prompt for class images.")
+        # if args.class_prompt is None:
+        #     raise ValueError("You must specify prompt for class images.")
 
     return args
 
@@ -693,6 +711,11 @@ class TargetedMaskingDatasetWithPriorPreservation(Dataset):
         self.tokenizer = tokenizer
         self.instance_image_captions = self.caption_file_reader(instance_image_captions_file)
         self.mask_directory = instance_images_mask_dir
+        instance_image_masks_list = os.listdir(self.mask_directory)
+        updated_instance_captions = dict()
+        for i in instance_image_masks_list:
+          updated_instance_captions[i] = self.instance_image_captions[i]
+        self.instance_image_captions = updated_instance_captions
         self.instance_image_list = [os.path.join(instance_image_dir, image_file) for image_file in self.instance_image_captions.keys()]
         self.class_image_captions = self.caption_file_reader(class_image_captions_file)
         self.class_image_list = [os.path.join(class_images_dir, image_file) for image_file in self.class_image_captions.keys()]
@@ -778,7 +801,7 @@ class TargetedMaskingDatasetWithPriorPreservation(Dataset):
     def __getitem__(self, idx):
         example = dict()
         image_name = os.path.basename(self.instance_image_list[idx])
-        instance_image = Image.open(self.instance_image_list[idx])
+        instance_image = Image.open(self.instance_image_list[idx] + ".jpg")
         mask_paths = os.listdir(os.path.join(self.mask_directory, image_name.split(".")[0]))
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
@@ -894,50 +917,50 @@ def main():
     if args.seed is not None:
         set_seed(args.seed)
 
-    if args.with_prior_preservation:
-        class_images_dir = Path(args.class_data_dir)
-        if not class_images_dir.exists():
-            class_images_dir.mkdir(parents=True)
-        cur_class_images = len(list(class_images_dir.iterdir()))
+    # if args.with_prior_preservation:
+    #     class_images_dir = Path(args.class_data_dir)
+    #     if not class_images_dir.exists():
+    #         class_images_dir.mkdir(parents=True)
+    #     cur_class_images = len(list(class_images_dir.iterdir()))
 
-        if cur_class_images < args.num_class_images:
-            torch_dtype = torch.float16 if accelerator.device.type == "cuda" else torch.float32
-            pipeline = StableDiffusionInpaintPipeline.from_pretrained(
-                args.pretrained_model_name_or_path, torch_dtype=torch_dtype, safety_checker=None
-            )
-            pipeline.set_progress_bar_config(disable=True)
+    #     if cur_class_images < args.num_class_images:
+    #         torch_dtype = torch.float16 if accelerator.device.type == "cuda" else torch.float32
+    #         pipeline = StableDiffusionInpaintPipeline.from_pretrained(
+    #             args.pretrained_model_name_or_path, torch_dtype=torch_dtype, safety_checker=None
+    #         )
+    #         pipeline.set_progress_bar_config(disable=True)
 
-            num_new_images = args.num_class_images - cur_class_images
-            logger.info(f"Number of class images to sample: {num_new_images}.")
+    #         num_new_images = args.num_class_images - cur_class_images
+    #         logger.info(f"Number of class images to sample: {num_new_images}.")
 
-            sample_dataset = PromptDataset(args.class_prompt, num_new_images)
-            sample_dataloader = torch.utils.data.DataLoader(
-                sample_dataset, batch_size=args.sample_batch_size, num_workers=1
-            )
+    #         sample_dataset = PromptDataset(args.class_prompt, num_new_images)
+    #         sample_dataloader = torch.utils.data.DataLoader(
+    #             sample_dataset, batch_size=args.sample_batch_size, num_workers=1
+    #         )
 
-            sample_dataloader = accelerator.prepare(sample_dataloader)
-            pipeline.to(accelerator.device)
-            transform_to_pil = transforms.ToPILImage()
-            for example in tqdm(
-                sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
-            ):
-                bsz = len(example["prompt"])
-                fake_images = torch.rand((3, args.resolution, args.resolution))
-                transform_to_pil = transforms.ToPILImage()
-                fake_pil_images = transform_to_pil(fake_images)
+    #         sample_dataloader = accelerator.prepare(sample_dataloader)
+    #         pipeline.to(accelerator.device)
+    #         transform_to_pil = transforms.ToPILImage()
+    #         for example in tqdm(
+    #             sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
+    #         ):
+    #             bsz = len(example["prompt"])
+    #             fake_images = torch.rand((3, args.resolution, args.resolution))
+    #             transform_to_pil = transforms.ToPILImage()
+    #             fake_pil_images = transform_to_pil(fake_images)
 
-                fake_mask = random_mask((args.resolution, args.resolution), ratio=1, mask_full_image=True)
+    #             fake_mask = random_mask((args.resolution, args.resolution), ratio=1, mask_full_image=True)
 
-                images = pipeline(prompt=example["prompt"], mask_image=fake_mask, image=fake_pil_images).images
+    #             images = pipeline(prompt=example["prompt"], mask_image=fake_mask, image=fake_pil_images).images
 
-                for i, image in enumerate(images):
-                    hash_image = insecure_hashlib.sha1(image.tobytes()).hexdigest()
-                    image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
-                    image.save(image_filename)
+    #             for i, image in enumerate(images):
+    #                 hash_image = insecure_hashlib.sha1(image.tobytes()).hexdigest()
+    #                 image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
+    #                 image.save(image_filename)
 
-            del pipeline
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+    #         del pipeline
+    #         if torch.cuda.is_available():
+    #             torch.cuda.empty_cache()
 
     # Handle the repository creation
     if accelerator.is_main_process:
@@ -1369,7 +1392,7 @@ def main():
                 # resize the mask to latents shape as we concatenate the mask to the latents
                 mask = torch.stack(
                     [
-                        torch.nn.functional.interpolate(mask, size=(args.resolution // 8, args.resolution // 8))
+                        torch.nn.functional.interpolate(mask.unsqueeze(0), size=(args.resolution // 8, args.resolution // 8))
                         for mask in masks
                     ]
                 ).to(dtype=weight_dtype)
