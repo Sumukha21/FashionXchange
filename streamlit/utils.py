@@ -8,10 +8,10 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from segment_anything import SamPredictor, sam_model_registry
 from diffusers import StableDiffusionInpaintPipeline
-from GroundingDINO.groundingdino.util.inference import load_model, load_image, predict, annotate
-from GroundingDINO.groundingdino.util import box_ops
+from groundingdino.util.inference import load_model, load_image, predict, annotate
+from groundingdino.util import box_ops
 import argparse
-from utils import *
+import groundingdino.datasets.transforms as T
 
 def show_mask(mask, image, random_color=True):
     """
@@ -154,3 +154,86 @@ def get_mask(groundingdino_model,sam_predictor, image_path, looking_for, device,
   axs[2].set_title('SAM o/p')
   axs[2].axis('off')
   return masks, src
+
+def dino_person_prediction(image_path, groundingdino_model, device):
+    src, img = load_image(image_path)
+    boxes_og, logits, phrases = predict(
+        model=groundingdino_model,
+        image=img,
+        caption="person",
+        box_threshold=0.3,
+        text_threshold=0.25,
+        device=device
+    )
+    return src, boxes_og, logits, phrases
+
+def find_person_in_image(src, boxes_og, phrases):
+    h, w, _ = src.shape
+    boxes = (boxes_og * torch.Tensor([w, h, w, h])).to(torch.int16)
+    boxes = box_convert(boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy").numpy()
+    boxes = np.array(boxes, dtype=np.int16)
+    # print(person_boxes, shirt)
+    if len(boxes) > 1:
+        person, selected_id = get_person_choice(src, [boxes[i] for i in boxes])
+        box = boxes[selected_id]
+        # box_og = boxes_og[person_boxes[selected_id]]
+    else:    
+        print(boxes[0])
+        box = boxes[0]
+        # box_og = boxes_og[person_boxes[0]]
+        person = src[box[1]: box[3], box[0]: box[2]]
+        print("The outfit change will be made to the following person: ")
+        plt.imshow(person)
+    return person, box
+
+
+def get_person_choice(src, boxes):
+    fig, axs = plt.subplots((len(boxes) // 3) + 1, 3, figsize=(20, 20))
+    people_list = []
+    for i in range(len(boxes)):
+        column = ((i + 1) % 3) - 1
+        row = i // 3
+        box = [int(j) for j in boxes[i]]
+        person_i = src[box[1]: box[3], box[0]: box[2], :]
+        people_list.append(person_i)
+        axs[row, column].imshow(person_i, cmap='gray')
+        axs[row, column].set_title(f'person_{i}')
+    plt.show()
+    print("Multiple people found in the image. Please select which person to chose based on the ID: ")
+    selected_index = input()
+    return people_list[int(selected_index)], int(selected_index)
+
+
+def get_outfit_in_person(person, attribute):
+    person_pil = Image.fromarray(person)
+    person_transformed, _ = transform(person_pil, None)
+    boxes, logits, phrases = predict(
+            model=groundingdino_model,
+            image=person_transformed,
+            caption=attribute,
+            box_threshold=0.3,
+            text_threshold=0.25,
+            device=device
+        )
+    return boxes, logits, phrases
+
+
+def select_required_clothing(ref_box, boxes):
+    ref_box = torch.tensor([ref_box])
+    boxes = torch.Tensor(boxes)
+    x1 = torch.max(ref_box[:, 0], boxes[:, 0])
+    y1 = torch.max(ref_box[:, 1], boxes[:, 1])
+    x2 = torch.min(ref_box[:, 0] + ref_box[:, 2], boxes[:, 0] + boxes[:, 2])
+    y2 = torch.min(ref_box[:, 1] + ref_box[:, 3], boxes[:, 1] + boxes[:, 3])
+    width = torch.clamp(x2 - x1, min=0)
+    height = torch.clamp(y2 - y1, min=0)
+    intersection_areas = width * height
+    return int(torch.argmax(intersection_areas))
+
+transform = T.Compose(
+        [
+            T.RandomResize([800], max_size=1333),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
