@@ -1,6 +1,7 @@
 import argparse
 import math
 import os
+import json
 import random
 from pathlib import Path
 import enum
@@ -522,7 +523,7 @@ def parse_args():
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument(
-        "--checkpointing_steps",
+        "--accelerator_state_checkpointing_steps",
         type=int,
         default=500,
         help=(
@@ -574,6 +575,34 @@ def parse_args():
         default=None,
         help="The output directory where the pipeline weights will be stored",
     )
+    parser.add_argument(
+        "--instance_images_mask_dir",
+        type=str,
+        default=r"C:\Users\smanjun3\Desktop\FashionXchange\text2human\Masks",
+        help="The directory where the instance image masks are stored",
+    )
+    # parser.add_argument(
+    #     "--class_prompt",
+    #     type=str,
+    #     default=None,
+    # )
+    parser.add_argument(
+        "--class_image_captions_file",
+        type=str,
+        default=None,
+        help=(
+            "Path to json/yaml/text file containig the text prompts for the class images"
+        )
+    )
+    parser.add_argument(
+        "--instance_image_captions_file",
+        type=str,
+        default=r"C:\Users\smanjun3\Desktop\FashionXchange\text2human\masked_image_captions.json",
+        required=False, #True,
+        help=(
+            "Path to json/yaml/text file containig the text prompts for the instance images"
+        )    
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -586,8 +615,6 @@ def parse_args():
     if args.with_prior_preservation:
         if args.class_data_dir is None:
             raise ValueError("You must specify a data directory for class images.")
-        if args.class_prompt is None:
-            raise ValueError("You must specify prompt for class images.")
 
     return args
 
@@ -691,9 +718,13 @@ class TargetedMaskingDatasetWithPriorPreservation(Dataset):
                 tokenizer,
                 image_size=512):
         self.tokenizer = tokenizer
-        self.instance_image_captions = self.caption_file_reader(instance_image_captions_file)
+        blip_instance_image_captions = self.caption_file_reader(instance_image_captions_file)
         self.mask_directory = instance_images_mask_dir
-        self.instance_image_list = [os.path.join(instance_image_dir, image_file) for image_file in self.instance_image_captions.keys()]
+        available_masks= self.caption_file_reader(r"C:\Users\smanjun3\Desktop\FashionXchange\text2human\generated_masks_captions.json")
+        # available_masks_list =[key.strip('.jpg') for key in available_masks.keys()]
+        available_masks_list=os.listdir(r"C:\Users\smanjun3\Desktop\FashionXchange\text2human\masks")
+        self.instance_image_captions={key: blip_instance_image_captions[key]+available_masks[key+'.jpg'] for key in blip_instance_image_captions.keys() and available_masks_list}
+        self.instance_image_list = [os.path.join(instance_image_dir, image_file+'.jpg') for image_file in self.instance_image_captions.keys() and available_masks_list]
         self.class_image_captions = self.caption_file_reader(class_image_captions_file)
         self.class_image_list = [os.path.join(class_images_dir, image_file) for image_file in self.class_image_captions.keys()]
         if len(self.class_image_list) > len(self.instance_image_list):
@@ -736,7 +767,7 @@ class TargetedMaskingDatasetWithPriorPreservation(Dataset):
         )
 
     def __len__(self):
-        return len(self.instance_image_captions)
+        return len(self.instance_image_list)
 
     @staticmethod
     def caption_file_reader(captions_file_path, image_directory=None):
@@ -790,7 +821,7 @@ class TargetedMaskingDatasetWithPriorPreservation(Dataset):
         example["PIL_image"] = instance_image
         example["instance_image"] = self.image_transforms(instance_image)
         example["instance_prompt_ids"] = self.tokenizer(
-            self.instance_image_captions[image_name],
+            self.instance_image_captions[image_name.strip('.jpg')],
             padding="do_not_pad",
             truncation=True,
             max_length=self.tokenizer.model_max_length,
@@ -1369,7 +1400,7 @@ def main():
                 # resize the mask to latents shape as we concatenate the mask to the latents
                 mask = torch.stack(
                     [
-                        torch.nn.functional.interpolate(mask, size=(args.resolution // 8, args.resolution // 8))
+                        torch.nn.functional.interpolate(mask.unsqueeze(0), size=(args.resolution // 8, args.resolution // 8))
                         for mask in masks
                     ]
                 ).to(dtype=weight_dtype)
@@ -1432,7 +1463,7 @@ def main():
                 progress_bar.update(1)
                 global_step += 1
 
-                if global_step % args.checkpointing_steps == 0:
+                if global_step % args.accelerator_state_checkpointing_steps == 0:
                     if accelerator.is_main_process:
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)

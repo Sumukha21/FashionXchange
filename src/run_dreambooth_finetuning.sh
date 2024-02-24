@@ -2,7 +2,7 @@
 
 MODEL_NAME="stabilityai/stable-diffusion-2-inpainting"
 INSTANCE_DIR="C:\Users\smanjun3\Desktop\FashionXchange\text2human\images"
-INSTANCE_CAPTION_FILE="C:\Users\smanjun3\Desktop\FashionXchange\text2_human_BLIP_dict.json" #"C:\Users\smanjun3\Desktop\FashionXchange\2667_IMAGES_dict.json"
+INSTANCE_CAPTION_FILE="C:\Users\smanjun3\Desktop\FashionXchange\text2_human_BLIP_dict.json"
 INSTANCE_IMAGE_MASKS_DIR="C:\Users\smanjun3\Desktop\FashionXchange\text2human\Masks"
 CLASS_DATA_DIR="C:\Users\smanjun3\Desktop\FashionXchange\flickr30k-images"
 CLASS_IMAGES_CAPTIONS_FILE="C:\Users\smanjun3\Desktop\FashionXchange\flickr_refined_captions.json"
@@ -12,7 +12,7 @@ PIPELINE_CHECKPOINTS_OUTPUT_DIR="C:\Users\smanjun3\Desktop\FashionXchange\Output
 
 
   
-accelerate launch sd_inpainting_finetuning.py \
+accelerate launch train_dreambooth_inpaint_lora.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --train_text_encoder \
   --with_prior_preservation \
