@@ -24,12 +24,11 @@ accelerate launch train_dreambooth_inpaint_lora.py \
   --output_dir=$OUTPUT_DIR \
   --logging_dir=$LOGGING_DIR \
   --resolution=512 \
+  --rank=4 \
   --train_batch_size=2 \
   --learning_rate=2e-6 \
   --lr_scheduler="constant" \
   --lr_warmup_steps=0 \
   --num_train_epochs=20 \
-  --accelerator_state_checkpointing_steps=51718 \
   --pipeline_checkpoints_output_dir=$PIPELINE_CHECKPOINTS_OUTPUT_DIR  \
   --pipeline_checkpointing_steps=20688 \
-  --rank=4

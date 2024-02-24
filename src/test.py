@@ -323,7 +323,7 @@ if __name__ == "__main4__":
         print("")
 
 
-if __name__ == "__main__":
+if __name__ == "__main5__":
     import os
     from PIL import Image, ImageDraw
     import numpy as np
@@ -600,3 +600,55 @@ if __name__ == "__main__":
     
     for i, example in enumerate(train_dataloader):
          print(example.keys())
+
+
+if __name__ == "__main6__":
+    import sys
+    sys.path.append(r"C:\Users\sumuk\OneDrive\Desktop\GitHub\FashionXchange")
+    import torch
+    import cv2
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from PIL import Image
+    from segment_anything import SamPredictor, sam_model_registry
+    from diffusers import StableDiffusionInpaintPipeline
+    from groundingdino.util.inference import load_model, load_image, predict, annotate
+    from GroundingDINO.groundingdino.util import box_ops
+    import argparse
+
+    def select_required_clothing(ref_box, boxes):
+        ref_box = torch.tensor([ref_box])
+        boxes = torch.Tensor(boxes)
+        x1 = torch.max(ref_box[:, 0], boxes[:, 0])
+        y1 = torch.max(ref_box[:, 1], boxes[:, 1])
+        x2 = torch.min(ref_box[:, 0] + ref_box[:, 2], boxes[:, 0] + boxes[:, 2])
+        y2 = torch.min(ref_box[:, 1] + ref_box[:, 3], boxes[:, 1] + boxes[:, 3])
+        width = torch.clamp(x2 - x1, min=0)
+        height = torch.clamp(y2 - y1, min=0)
+        intersection_areas = width * height
+        return boxes[torch.argmax(intersection_areas)]
+
+    device = "cpu"
+    groundingdino_model_path = r"C:\Users\sumuk\OneDrive\Desktop\GitHub\FashionXchange\GroundingDINO\groundingdino\config\GroundingDINO_SwinT_OGC.py"
+    groundingdino_weights_path = r"C:\Users\sumuk\OneDrive\Desktop\GitHub\FashionXchange\GroundingDINO\weights\groundingdino_swint_ogc.pth"
+    groundingdino_model = load_model(groundingdino_model_path, groundingdino_weights_path)
+    
+    image_path = r"C:\Users\sumuk\OneDrive\Desktop\GitHub\FashionXchange\me_ootb.jpg"
+
+    src, img = load_image(image_path)
+
+    boxes, logits, phrases = predict(
+        model=groundingdino_model,
+        image=img,
+        caption="person, shirt",
+        box_threshold=0.3,
+        text_threshold=0.25,
+        device=device
+    )
+    h, w, _ = src.shape
+    boxes_rs = boxes * torch.Tensor([w, h, w, h])
+    boxes_rs = [[int(i) for i in j] for j in boxes_rs]
+    ex_box = boxes_rs[0]
+    shirt_boxes = [i for j, i in enumerate(boxes_rs) if phrases[j] == "shirt"]
+    selected_shirt_box = select_required_clothing(ex_box, shirt_boxes)
+    print("")
