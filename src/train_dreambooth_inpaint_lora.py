@@ -633,12 +633,6 @@ def parse_args():
     if args.with_prior_preservation:
         if args.class_data_dir is None:
             raise ValueError("You must specify a data directory for class images.")
-<<<<<<< HEAD
-=======
-        # if args.class_prompt is None:
-        #     raise ValueError("You must specify prompt for class images.")
->>>>>>> aa20f455da47c3810877752d6363fabcfe949724
-
     return args
 
 
@@ -743,20 +737,11 @@ class TargetedMaskingDatasetWithPriorPreservation(Dataset):
         self.tokenizer = tokenizer
         blip_instance_image_captions = self.caption_file_reader(instance_image_captions_file)
         self.mask_directory = instance_images_mask_dir
-<<<<<<< HEAD
         available_masks= self.caption_file_reader(r"C:\Users\smanjun3\Desktop\FashionXchange\text2human\generated_masks_captions.json")
         # available_masks_list =[key.strip('.jpg') for key in available_masks.keys()]
         available_masks_list=os.listdir(r"C:\Users\smanjun3\Desktop\FashionXchange\text2human\masks")
         self.instance_image_captions={key: blip_instance_image_captions[key]+available_masks[key+'.jpg'] for key in blip_instance_image_captions.keys() and available_masks_list}
         self.instance_image_list = [os.path.join(instance_image_dir, image_file+'.jpg') for image_file in self.instance_image_captions.keys() and available_masks_list]
-=======
-        instance_image_masks_list = os.listdir(self.mask_directory)
-        updated_instance_captions = dict()
-        for i in instance_image_masks_list:
-          updated_instance_captions[i] = self.instance_image_captions[i]
-        self.instance_image_captions = updated_instance_captions
-        self.instance_image_list = [os.path.join(instance_image_dir, image_file) for image_file in self.instance_image_captions.keys()]
->>>>>>> aa20f455da47c3810877752d6363fabcfe949724
         self.class_image_captions = self.caption_file_reader(class_image_captions_file)
         self.class_image_list = [os.path.join(class_images_dir, image_file) for image_file in self.class_image_captions.keys()]
         if len(self.class_image_list) > len(self.instance_image_list):
