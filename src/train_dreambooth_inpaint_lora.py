@@ -571,11 +571,6 @@ def parse_args():
         default=r"C:\Users\smanjun3\Desktop\FashionXchange\text2human\Masks",
         help="The directory where the instance image masks are stored",
     )
-    # parser.add_argument(
-    #     "--class_prompt",
-    #     type=str,
-    #     default=None,
-    # )
     parser.add_argument(
         "--class_image_captions_file",
         type=str,
@@ -592,33 +587,6 @@ def parse_args():
         help=(
             "Path to json/yaml/text file containig the text prompts for the instance images"
         )    
-    )
-
-
-    parser.add_argument(
-        "--class_image_captions_file",
-        type=str,
-        default=None,
-        help=(
-            "Path to json/yaml/text file containig the text prompts for the class images"
-        )
-    )
-
-    parser.add_argument(
-        "--instance_image_captions_file",
-        type=str,
-        default=r"C:\Users\smanjun3\Desktop\FashionXchange\text2human\masked_image_captions.json",
-        required=False, #True,
-        help=(
-            "Path to json/yaml/text file containig the text prompts for the instance images"
-        )    
-    )
-
-    parser.add_argument(
-        "--instance_images_mask_dir",
-        type=str,
-        default=r"C:\Users\smanjun3\Desktop\FashionXchange\text2human\Masks",
-        help="The directory where the instance image masks are stored",
     )
     
 
@@ -633,6 +601,7 @@ def parse_args():
     if args.with_prior_preservation:
         if args.class_data_dir is None:
             raise ValueError("You must specify a data directory for class images.")
+
     return args
 
 
@@ -745,7 +714,7 @@ class TargetedMaskingDatasetWithPriorPreservation(Dataset):
         self.class_image_captions = self.caption_file_reader(class_image_captions_file)
         self.class_image_list = [os.path.join(class_images_dir, image_file) for image_file in self.class_image_captions.keys()]
         if len(self.class_image_list) > len(self.instance_image_list):
-            self.class_image_list = random.sample(self.class_image_list, len(self.instance_image_list) - 1)
+            self.class_image_list = random.sample(self.class_image_list, len(self.instance_image_list))
         elif len(self.class_image_list) < len(self.instance_image_list):
             required_samples_count = len(self.instance_image_list) - len(self.class_image_list)
             while required_samples_count > 0:
@@ -756,6 +725,8 @@ class TargetedMaskingDatasetWithPriorPreservation(Dataset):
                     class_image_list = random.sample(self.class_image_list, required_samples_count)
                     required_samples_count = 0
                 self.class_image_list.extend(class_image_list)
+        
+        assert len(self.class_image_list)==len(self.instance_image_list)
 
         self.image_transforms_resize_and_crop = transforms.Compose(
             [
@@ -826,7 +797,7 @@ class TargetedMaskingDatasetWithPriorPreservation(Dataset):
     def __getitem__(self, idx):
         example = dict()
         image_name = os.path.basename(self.instance_image_list[idx])
-        instance_image = Image.open(self.instance_image_list[idx] + ".jpg")
+        instance_image = Image.open(self.instance_image_list[idx])
         mask_paths = os.listdir(os.path.join(self.mask_directory, image_name.split(".")[0]))
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
