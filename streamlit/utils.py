@@ -5,13 +5,15 @@ import torch
 import torch
 import cv2
 import matplotlib.pyplot as plt
+import argparse
+import groundingdino.datasets.transforms as T
 from PIL import Image
 from segment_anything import SamPredictor, sam_model_registry
 from diffusers import StableDiffusionInpaintPipeline
 from groundingdino.util.inference import load_model, load_image, predict, annotate
 from groundingdino.util import box_ops
-import argparse
-import groundingdino.datasets.transforms as T
+from torchvision.ops import box_convert
+
 
 def show_mask(mask, image, random_color=True):
     """
@@ -155,8 +157,7 @@ def get_mask(groundingdino_model,sam_predictor, image_path, looking_for, device,
   axs[2].axis('off')
   return masks, src
 
-def dino_person_prediction(image_path, groundingdino_model, device):
-    src, img = load_image(image_path)
+def dino_person_prediction(img, groundingdino_model, device):
     boxes_og, logits, phrases = predict(
         model=groundingdino_model,
         image=img,
@@ -165,9 +166,9 @@ def dino_person_prediction(image_path, groundingdino_model, device):
         text_threshold=0.25,
         device=device
     )
-    return src, boxes_og, logits, phrases
+    return boxes_og, logits, phrases
 
-def find_person_in_image(src, boxes_og, phrases):
+def find_person_in_image(src, boxes_og):
     h, w, _ = src.shape
     boxes = (boxes_og * torch.Tensor([w, h, w, h])).to(torch.int16)
     boxes = box_convert(boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy").numpy()
@@ -187,6 +188,20 @@ def find_person_in_image(src, boxes_og, phrases):
     return person, box
 
 
+def get_outfit_in_person(groundingdino_model, person, attribute, device):
+    person_pil = Image.fromarray(person)
+    person_transformed, _ = transform(person_pil, None)
+    boxes, logits, phrases = predict(
+            model=groundingdino_model,
+            image=person_transformed,
+            caption=attribute,
+            box_threshold=0.3,
+            text_threshold=0.25,
+            device=device
+        )
+    return boxes, logits, phrases
+
+
 def get_person_choice(src, boxes):
     fig, axs = plt.subplots((len(boxes) // 3) + 1, 3, figsize=(20, 20))
     people_list = []
@@ -204,9 +219,9 @@ def get_person_choice(src, boxes):
     return people_list[int(selected_index)], int(selected_index)
 
 
-def get_outfit_in_person(person, attribute):
-    person_pil = Image.fromarray(person)
-    person_transformed, _ = transform(person_pil, None)
+def get_outfit_in_person(person, attribute, groundingdino_model, device):
+    # person_pil = Image.fromarray(person)
+    person_transformed, _ = transform(person, None)
     boxes, logits, phrases = predict(
             model=groundingdino_model,
             image=person_transformed,
