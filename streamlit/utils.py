@@ -220,8 +220,8 @@ def get_person_choice(src, boxes):
 
 
 def get_outfit_in_person(person, attribute, groundingdino_model, device):
-    # person_pil = Image.fromarray(person)
-    person_transformed, _ = transform(person, None)
+    person_pil = Image.fromarray(person)
+    person_transformed, _ = transform(person_pil, None)
     boxes, logits, phrases = predict(
             model=groundingdino_model,
             image=person_transformed,

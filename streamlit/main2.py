@@ -4,8 +4,8 @@ import numpy as np
 from PIL import Image
 from segment_anything import SamPredictor, sam_model_registry
 from diffusers import StableDiffusionInpaintPipeline
-from groundingdino.util.inference import load_model, load_image
-from utils import dino_person_prediction, find_person_in_image, get_outfit_in_person, show_mask
+from groundingdino.util.inference import load_model, load_image, annotate
+from utils import dino_person_prediction, find_person_in_image, get_outfit_in_person, show_mask, transform_boxes
 from torchvision.ops import box_convert
 
 def main():
@@ -26,13 +26,12 @@ def main():
 
     sam_predictor = load_sam_model()
 
-    # # Stable Diffusion
-    # @st.cache_resource
-    # def load_pipeline():
-    #     return StableDiffusionInpaintPipeline.from_pretrained(r"C:\Users\sumuk\OneDrive\Desktop\GitHub\FashionXchange\checkpoint-82752",
-    #                                                     torch_dtype=torch.float16).to(device)
+    # Stable Diffusion
+    @st.cache_resource
+    def load_pipeline():
+        return StableDiffusionInpaintPipeline.from_pretrained(r"C:\Users\sumuk\OneDrive\Desktop\GitHub\FashionXchange\checkpoint-82752").to(device)
 
-    # pipeline = load_pipeline()
+    pipeline = load_pipeline()
 
     # Grounding DINO
     @st.cache_resource
@@ -91,7 +90,7 @@ def main():
                 cols = st.columns(columns)  #cols = columns_layout.columns(columns) 
                 for idx2 in range(columns): 
                     idx_cur = idx * columns + idx2
-                    if idx_cur >= total_image_count - 1:
+                    if idx_cur >= total_image_count:
                         continue
                     person = Image.fromarray(people_list[idx_cur])
                     p = cols[idx2].image(person.resize((100, 200), resample=1), use_column_width=True)
@@ -103,34 +102,43 @@ def main():
                 other_field.empty()
                 for p_i in people_placeholders:
                     p_i.empty()
-                st.write("Selected person: ", selected_person)
+                # st.write("Selected person: ", selected_person)
                 imageLocation.image(Image.fromarray(people_list[selected_person]).resize((100, 200), 1))
+                person = people_list[selected_person]
+                selected_person_box = boxes[selected_person]
                 st.session_state.person_selected = True
         else:
             box = boxes[0]
             person = src[box[1]: box[3], box[0]: box[2], :]
-            st.write("Selected person: ")
+            # st.write("Selected person: ")
             imageLocation.image(person)
             st.session_state.person_selected = True 
         
         if st.session_state.person_selected:
-            with st.spinner('Masking the requested clothing in the image'):
+            with st.spinner('Making the requesting outfit modification'):
                 attribute_boxes, attribute_logits, attribute_phrases = get_outfit_in_person(person, "clothes", groundingdino_model, device)
-                sam_predictor.set_image(person)
+                attribute_boxes_tr = transform_boxes(sam_predictor, attribute_boxes, person, device)
+
+                sam_predictor.set_image(np.array(person))
                 masks, _, _ = sam_predictor.predict_torch(
                     point_coords=None,
                     point_labels=None,
-                    boxes=torch.Tensor(attribute_boxes),
+                    boxes=torch.Tensor(attribute_boxes_tr),
                     multimask_output=False,
                 )
                 masks = torch.any(masks, dim=0, keepdim=True)
-                img_annotated_mask = show_mask(
-                                                    masks[0][0].cpu(),
-                                                    person
-                                                )
-                imageLocation.image(img_annotated_mask)        
 
-                
+                edited_image = pipeline(prompt=input_string,
+                            image=Image.fromarray(person).resize((512, 512)),
+                            mask_image=Image.fromarray(masks[0][0].numpy()).resize((512, 512))
+                            ).images[0]
+                edited_image = edited_image.resize((person.shape[1], person.shape[0]))
+                src = np.array(src)
+                src[selected_person_box[1]: selected_person_box[3], selected_person_box[0]: selected_person_box[2]] = edited_image
+                imageLocation.empty()
+                imageLocation.image(src)
+
+
 # # Main Streamlit app
 # def main():
 #     # Check if data is already submitted
