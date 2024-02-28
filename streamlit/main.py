@@ -52,23 +52,14 @@ def main():
         st.session_state.allow_modifications = False
 
     other_field = st.empty()
+    side_bar=st.sidebar
         
-    with st.sidebar:
+    with side_bar:
         st.write("Upload file")
         uploaded_file = st.file_uploader("Choose a file")
         if st.button("Upload Image"):
             if uploaded_file is not None:
                 st.session_state.image_submitted=True
-
-        if st.session_state.image_submitted and st.session_state.allow_modifications:
-            st.write("Select modifications after person is selected")
-            looking_for= st.selectbox('Select dress areas to modify:', ('Clothes, arms, legs', 'Shirt, arms', 'Pant, legs'))
-            input_string = st.text_input("Enter prompt to make changes:", "A man wearing a blue shirt")
-
-            if st.button("Submit"):
-                if uploaded_file is not None and looking_for is not None and input_string is not None:
-                    st.session_state.data_submitted = True
-        
 
 
     if st.session_state.image_submitted:
@@ -99,7 +90,7 @@ def main():
                 row = (len(people_list) // columns) + 1
             people_placeholders = []
             for idx in range(row):
-                cols = st.columns(columns)  #cols = columns_layout.columns(columns) 
+                cols = st.columns(columns) 
                 for idx2 in range(columns): 
                     idx_cur = idx * columns + idx2
                     if idx_cur >= total_image_count:
@@ -114,26 +105,32 @@ def main():
                 other_field.empty()
                 for p_i in people_placeholders:
                     p_i.empty()
-                # st.write("Selected person: ", selected_person)
                 imageLocation.image(Image.fromarray(people_list[selected_person]).resize((100, 200), 1))
                 person = people_list[selected_person]
                 selected_person_box = boxes[selected_person]
                 st.session_state.person_selected = True
-                st.session_state.image_submitted = True
-                
+               
         else:
             box = boxes[0]
             selected_person_box = box
             person = src[box[1]: box[3], box[0]: box[2], :]
-            # st.write("Selected person: ")
             imageLocation.image(person)
             st.session_state.person_selected = True 
-            st.session_state.image_submitted = True
         
     if st.session_state.person_selected:
         st.session_state.image_submitted=True
         st.session_state.allow_modifications = True
 
+    with side_bar:
+        if st.session_state.image_submitted and st.session_state.allow_modifications:
+            st.write("Select modifications after person is selected")
+            looking_for= st.selectbox('Select dress areas to modify:', ('Clothes, arms, legs', 'Shirt, arms', 'Pant, legs'))
+            input_string = st.text_input("Enter prompt to make changes:", "A man wearing a blue shirt")
+
+            if st.button("Submit"):
+                if uploaded_file is not None and looking_for is not None and input_string is not None:
+                    st.session_state.data_submitted = True
+        
     if st.session_state.person_selected and st.session_state.data_submitted:
 
         with st.spinner('Making the requesting outfit modification'):
