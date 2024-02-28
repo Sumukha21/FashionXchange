@@ -10,12 +10,11 @@ from torchvision.ops import box_convert
 
 def main():
     st.title('FashionXchange')
-    device = torch.device("cpu")
+    device = torch.device("cuda")
     # Paths
-    sam_checkpoint_path = r"C:\Users\sumuk\OneDrive\Desktop\GitHub\FashionXchange\GroundingDINO\weights\sam_vit_h_4b8939.pth"
-    groundingdino_model_path = r"C:\Users\sumuk\OneDrive\Desktop\GitHub\FashionXchange\GroundingDINO\groundingdino\config\GroundingDINO_SwinT_OGC.py"
-    groundingdino_weights_path = r"C:\Users\sumuk\OneDrive\Desktop\GitHub\FashionXchange\GroundingDINO\weights\groundingdino_swint_ogc.pth"
-
+    sam_checkpoint_path = "/home/kganapa/projects/FashioXchange/weights/sam_vit_h_4b8939.pth"
+    groundingdino_model_path = "/home/kganapa/projects/FashioXchange/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
+    groundingdino_weights_path = "/home/kganapa/projects/FashioXchange/weights/groundingdino_swint_ogc.pth"
     # SAM Parameters
     model_type = "vit_h"
     sam_model = sam_model_registry[model_type](checkpoint=sam_checkpoint_path).to(device=device)
@@ -29,7 +28,7 @@ def main():
     # Stable Diffusion
     @st.cache_resource
     def load_pipeline():
-        return StableDiffusionInpaintPipeline.from_pretrained(r"C:\Users\sumuk\OneDrive\Desktop\GitHub\FashionXchange\checkpoint-82752").to(device)
+        return StableDiffusionInpaintPipeline.from_pretrained("/home/kganapa/projects/FashioXchange/stable-diffusion-2-inpainting").to(device)
 
     pipeline = load_pipeline()
 
@@ -40,6 +39,8 @@ def main():
 
     groundingdino_model = load_gdino()
 
+    if "image_submitted" not in st.session_state:
+        st.session_state.image_submitted = False
 
     if "data_submitted" not in st.session_state:
         st.session_state.data_submitted = False
@@ -52,14 +53,20 @@ def main():
     with st.sidebar:
         st.write("Upload file")
         uploaded_file = st.file_uploader("Choose a file")
-        looking_for= st.selectbox('Select dress areas to modify:', ('Clothes, arms, legs', 'Shirt, arms', 'Pant, legs'))
-        input_string = st.text_input("Enter prompt to make changes:", "A man wearing a blue shirt")
+        if st.button("Upload Image"):
+            if uploaded_file is not None:
+                st.session_state.image_submitted=True
 
-        if st.button("Submit"):
-            if uploaded_file is not None and looking_for is not None and input_string is not None:
-                st.session_state.data_submitted = True
+        if st.session_state.image_submitted:
+            st.write("Select modifications after person is selected")
+            looking_for= st.selectbox('Select dress areas to modify:', ('Clothes, arms, legs', 'Shirt, arms', 'Pant, legs'))
+            input_string = st.text_input("Enter prompt to make changes:", "A man wearing a blue shirt")
 
-    if st.session_state.data_submitted:
+            if st.button("Submit"):
+                if uploaded_file is not None and looking_for is not None and input_string is not None:
+                    st.session_state.data_submitted = True
+
+    if st.session_state.image_submitted:
         src, img = load_image(uploaded_file)
         imageLocation = st.empty()
         imageLocation.image(src)
@@ -109,14 +116,16 @@ def main():
                 st.session_state.person_selected = True
         else:
             box = boxes[0]
+            selected_person_box = box
             person = src[box[1]: box[3], box[0]: box[2], :]
             # st.write("Selected person: ")
             imageLocation.image(person)
             st.session_state.person_selected = True 
         
-        if st.session_state.person_selected:
+        if st.session_state.person_selected and st.session_state.data_submitted:
+
             with st.spinner('Making the requesting outfit modification'):
-                attribute_boxes, attribute_logits, attribute_phrases = get_outfit_in_person(person, "clothes", groundingdino_model, device)
+                attribute_boxes, attribute_logits, attribute_phrases = get_outfit_in_person(person, looking_for, groundingdino_model, device)
                 attribute_boxes_tr = transform_boxes(sam_predictor, attribute_boxes, person, device)
 
                 sam_predictor.set_image(np.array(person))
@@ -130,53 +139,13 @@ def main():
 
                 edited_image = pipeline(prompt=input_string,
                             image=Image.fromarray(person).resize((512, 512)),
-                            mask_image=Image.fromarray(masks[0][0].numpy()).resize((512, 512))
+                            mask_image=Image.fromarray(masks[0][0].cpu().numpy()).resize((512, 512))
                             ).images[0]
                 edited_image = edited_image.resize((person.shape[1], person.shape[0]))
                 src = np.array(src)
                 src[selected_person_box[1]: selected_person_box[3], selected_person_box[0]: selected_person_box[2]] = edited_image
                 imageLocation.empty()
                 imageLocation.image(src)
-
-
-# # Main Streamlit app
-# def main():
-#     # Check if data is already submitted
-#     if "data_submitted" not in st.session_state:
-#         st.session_state.data_submitted = False
-#     other_field = st.empty()
-#     # Sidebar with file uploader and submit button
-#     with st.sidebar:
-#         st.write("Upload file")
-#         uploaded_file = st.file_uploader("Choose a file")
-
-#         # Check if submit button is clicked
-#         if st.button("Submit"):
-#             if uploaded_file is not None:
-#                 st.session_state.data_submitted = True
-
-#     # Main content area
-#     if st.session_state.data_submitted:
-#         imageLocation = st.empty()
-#         # Display the uploaded image
-#         img = Image.open(uploaded_file)
-#         imageLocation.image(img, caption='Uploaded Image', use_column_width=True)
-                
-#         # Dropdown for user interaction
-#         selected_option = other_field.selectbox("Select an option", ["Please Select", "Option 1", "Option 2", "Option 3"])
-
-#         # Check if an option is selected
-#         if selected_option != "Please Select":
-#             other_field.empty()
-#             # Display another image
-#             st.write("People displayed")
-#             images = [img for i in range(12)]
-#             imageLocation.empty()
-#             for idx in range(3):
-#                 cols = st.columns(4) 
-#                 for idx2 in range(4): 
-#                     cols[idx2].image(images[(idx + 1) * idx2], use_column_width=True)
-        
 
 # Run the main function
 if __name__ == "__main__":
