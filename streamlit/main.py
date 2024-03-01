@@ -10,13 +10,16 @@ from torchvision.ops import box_convert
 
 def main():
     st.title('FashionXchange')
-    device = torch.device("cuda")
+    if torch.cuda_is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
     # Paths
-    sam_checkpoint_path = "/home/kganapa/projects/FashioXchange/weights/sam_vit_h_4b8939.pth"
+    sam_checkpoint_path = "/home/kganapa/projects/FashioXchange/weights/sam_vit_l_0b3195.pth"
     groundingdino_model_path = "/home/kganapa/projects/FashioXchange/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
     groundingdino_weights_path = "/home/kganapa/projects/FashioXchange/weights/groundingdino_swint_ogc.pth"
     # SAM Parameters
-    model_type = "vit_h"
+    model_type = "vit_l"
     sam_model = sam_model_registry[model_type](checkpoint=sam_checkpoint_path).to(device=device)
 
     @st.cache_resource
@@ -39,6 +42,8 @@ def main():
 
     groundingdino_model = load_gdino()
 
+    # Initialize streamlit session state variables
+
     if "image_submitted" not in st.session_state:
         st.session_state.image_submitted = False
 
@@ -50,10 +55,21 @@ def main():
 
     if "allow_modifications" not in st.session_state:
         st.session_state.allow_modifications = False
+    
+    if "original_image_displayed" not in st.session_state:
+        st.session_state.original_image_displayed = False
+
+    if "person_images_shown" not in st.session_state:
+        st.session_state.person_images_shown = False
+
+    if "boxes" not in st.session_state:
+        st.session_state.boxes = 0  
 
     other_field = st.empty()
     side_bar=st.sidebar
-        
+    imageLocation = st.empty()
+
+    # Sidebar elements   
     with side_bar:
         st.write("Upload file")
         uploaded_file = st.file_uploader("Choose a file")
@@ -64,17 +80,21 @@ def main():
 
     if st.session_state.image_submitted:
         src, img = load_image(uploaded_file)
-        imageLocation = st.empty()
-        imageLocation.image(src)
+       
+        if st.session_state.image_submitted and not st.session_state.original_image_displayed:
+            imageLocation.image(src)
 
-        with st.spinner('Searching for people in the image...'):
-            boxes_og, logits, phrases = dino_person_prediction(img, groundingdino_model, device)
-            h, w, _ = src.shape
-            boxes = (boxes_og * torch.Tensor([w, h, w, h])).to(torch.int16)
-            boxes = box_convert(boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy").numpy()
-            boxes = np.array(boxes, dtype=np.int16)
+            with st.spinner('Searching for people in the image...'):
+                boxes_og, logits, phrases = dino_person_prediction(img, groundingdino_model, device)
+                h, w, _ = src.shape
+                ss_boxes = (boxes_og * torch.Tensor([w, h, w, h])).to(torch.int16)
+                ss_boxes = box_convert(boxes=ss_boxes, in_fmt="cxcywh", out_fmt="xyxy").numpy()
+                ss_boxes = np.array(ss_boxes, dtype=np.int16)
+                st.session_state.boxes = ss_boxes
         
         imageLocation.empty()
+        st.session_state.original_image_displayed = True
+        boxes = st.session_state.boxes
 
         if len(boxes) > 1:
             people_list = []
@@ -96,8 +116,9 @@ def main():
                     if idx_cur >= total_image_count:
                         continue
                     person = Image.fromarray(people_list[idx_cur])
-                    p = cols[idx2].image(person.resize((100, 200), resample=1), use_column_width=True)
-                    people_placeholders.append(p)
+                    if not st.session_state.person_selected and not st.session_state.person_images_shown:
+                        p = cols[idx2].image(person.resize((100, 200), resample=1), use_column_width=True)
+                        people_placeholders.append(p)
             options = [f"Person {i}" for i in range(total_image_count)]
             selected_option = other_field.selectbox("Select an option", ["Please Select", *options])
             if selected_option != "Please Select":
@@ -105,7 +126,8 @@ def main():
                 other_field.empty()
                 for p_i in people_placeholders:
                     p_i.empty()
-                imageLocation.image(Image.fromarray(people_list[selected_person]).resize((100, 200), 1))
+                if not st.session_state.data_submitted:    
+                    imageLocation.image(Image.fromarray(people_list[selected_person]).resize((100, 200), 1))
                 person = people_list[selected_person]
                 selected_person_box = boxes[selected_person]
                 st.session_state.person_selected = True
@@ -114,15 +136,14 @@ def main():
             box = boxes[0]
             selected_person_box = box
             person = src[box[1]: box[3], box[0]: box[2], :]
-            imageLocation.image(person)
+            if not st.session_state.person_selected and not st.session_state.person_images_shown:
+                imageLocation.image(person)
             st.session_state.person_selected = True 
         
-    if st.session_state.person_selected:
-        st.session_state.image_submitted=True
-        st.session_state.allow_modifications = True
+        st.session_state.person_images_shown = True
 
     with side_bar:
-        if st.session_state.image_submitted and st.session_state.allow_modifications:
+        if st.session_state.image_submitted and st.session_state.person_selected:
             st.write("Select modifications after person is selected")
             looking_for= st.selectbox('Select dress areas to modify:', ('Clothes, arms, legs', 'Shirt, arms', 'Pant, legs'))
             input_string = st.text_input("Enter prompt to make changes:", "A man wearing a blue shirt")
@@ -133,7 +154,7 @@ def main():
         
     if st.session_state.person_selected and st.session_state.data_submitted:
 
-        with st.spinner('Making the requesting outfit modification'):
+        with st.spinner('Making the requested outfit modification'):
             attribute_boxes, attribute_logits, attribute_phrases = get_outfit_in_person(person, looking_for, groundingdino_model, device)
             attribute_boxes_tr = transform_boxes(sam_predictor, attribute_boxes, person, device)
 
