@@ -1,52 +1,52 @@
 """
-    Source: https://github.com/huggingface/diffusers/blob/main/examples/research_projects/dreambooth_inpaint/train_dreambooth_inpaint.py
-    Modifications:
-        1. DreamBoothDataset replaced with TrainDataset: 
-            Allows loading images with corresponding prompts for both instance and class images
-            (DreamBoothDataset had a single prompt for class images and another prompt for instance images)
-        2. PromptDataset replaced with ClassDatasetSampleGeneraion:
-            Allows loading of prompts using which class samples can be generated for prior preservation loss
-        3. TargetedMaskingDataset and TargetedMaskingDatasetWithPriorPreservation classes were added to support
-           targetted masking of data as an alternative to random masking. These classes expect the user to provide 
-           the corresponding mask as well. These classes also provide random perturbation of the masks to avoid overfitting.
+    source: https://github.com/huggingface/diffusers/blob/main/examples/research_projects/dreambooth_inpaint/train_dreambooth_inpaint_lora.py
+    TargetedMaskingDatasetWithPriorPreservation class was added to support
+    targetted masking of data as an alternative to random masking. These classes expect the user to provide 
+    the corresponding mask as well. These classes also provide random perturbation of the masks to avoid overfitting.
 """
 
-
-import os
-import math
-import torch
-import itertools
-import random
-import json
-from glob import glob
 import argparse
-import numpy as np
-import torch.nn.functional as F
-from PIL import Image, ImageDraw
+import math
+import os
+import json
+import random
 from pathlib import Path
-from torch.utils.data import Dataset
+import enum
+import numpy as np
+import torch
+import json
+import torch.nn.functional as F
+import torch.utils.checkpoint
 from accelerate import Accelerator
-from accelerate.utils import ProjectConfiguration, set_seed
 from accelerate.logging import get_logger
+from accelerate.utils import ProjectConfiguration, set_seed
+from huggingface_hub import create_repo, upload_folder
+from huggingface_hub.utils import insecure_hashlib
+from PIL import Image, ImageDraw
+from torch.utils.data import Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
-from diffusers import (
-    AutoencoderKL,
-    DDPMScheduler,
-    StableDiffusionInpaintPipeline,
-    StableDiffusionPipeline,
-    UNet2DConditionModel,
-)
-from huggingface_hub.utils import insecure_hashlib
-from huggingface_hub import create_repo, upload_folder
-from diffusers.optimization import get_scheduler
-# from src.utils.utils import text_file_reader
-# from src.datasets import TargetedMaskingDataset
 
+from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionInpaintPipeline, UNet2DConditionModel
+# from diffusers.loaders import AttnProcsLayers
+# from diffusers.models.attention_processor import LoRAAttnProcessor
+from diffusers.optimization import get_scheduler
+from diffusers.utils import check_min_version
+from diffusers.utils.import_utils import is_xformers_available
+from diffusers.utils.torch_utils import is_compiled_module
+from diffusers.loaders import LoraLoaderMixin
+from typing import Any, Dict, Iterable, List, Optional, Union
+
+from peft import LoraConfig
+from peft.utils import get_peft_model_state_dict, set_peft_model_state_dict
+
+
+
+# Will error if the minimal version of diffusers is not installed. Remove at your own risks.
+check_min_version("0.13.0.dev0")
 
 logger = get_logger(__name__)
-
 
 def text_file_reader(file_path):
     """
@@ -67,6 +67,257 @@ def text_file_reader(file_path):
     except Exception as e:
         print(f"Error reading file: {e}")
         return None
+
+class StateDictType(enum.Enum):
+    """
+    The mode to use when converting state dicts.
+    """
+
+    DIFFUSERS_OLD = "diffusers_old"
+    KOHYA_SS = "kohya_ss"
+    PEFT = "peft"
+    DIFFUSERS = "diffusers"
+
+
+# We need to define a proper mapping for Unet since it uses different output keys than text encoder
+# e.g. to_q_lora -> q_proj / to_q
+UNET_TO_DIFFUSERS = {
+    ".to_out_lora.up": ".to_out.0.lora_B",
+    ".to_out_lora.down": ".to_out.0.lora_A",
+    ".to_q_lora.down": ".to_q.lora_A",
+    ".to_q_lora.up": ".to_q.lora_B",
+    ".to_k_lora.down": ".to_k.lora_A",
+    ".to_k_lora.up": ".to_k.lora_B",
+    ".to_v_lora.down": ".to_v.lora_A",
+    ".to_v_lora.up": ".to_v.lora_B",
+    ".lora.up": ".lora_B",
+    ".lora.down": ".lora_A",
+}
+
+
+DIFFUSERS_TO_PEFT = {
+    ".q_proj.lora_linear_layer.up": ".q_proj.lora_B",
+    ".q_proj.lora_linear_layer.down": ".q_proj.lora_A",
+    ".k_proj.lora_linear_layer.up": ".k_proj.lora_B",
+    ".k_proj.lora_linear_layer.down": ".k_proj.lora_A",
+    ".v_proj.lora_linear_layer.up": ".v_proj.lora_B",
+    ".v_proj.lora_linear_layer.down": ".v_proj.lora_A",
+    ".out_proj.lora_linear_layer.up": ".out_proj.lora_B",
+    ".out_proj.lora_linear_layer.down": ".out_proj.lora_A",
+    ".lora_linear_layer.up": ".lora_B",
+    ".lora_linear_layer.down": ".lora_A",
+}
+
+DIFFUSERS_OLD_TO_PEFT = {
+    ".to_q_lora.up": ".q_proj.lora_B",
+    ".to_q_lora.down": ".q_proj.lora_A",
+    ".to_k_lora.up": ".k_proj.lora_B",
+    ".to_k_lora.down": ".k_proj.lora_A",
+    ".to_v_lora.up": ".v_proj.lora_B",
+    ".to_v_lora.down": ".v_proj.lora_A",
+    ".to_out_lora.up": ".out_proj.lora_B",
+    ".to_out_lora.down": ".out_proj.lora_A",
+    ".lora_linear_layer.up": ".lora_B",
+    ".lora_linear_layer.down": ".lora_A",
+}
+
+PEFT_TO_DIFFUSERS = {
+    ".q_proj.lora_B": ".q_proj.lora_linear_layer.up",
+    ".q_proj.lora_A": ".q_proj.lora_linear_layer.down",
+    ".k_proj.lora_B": ".k_proj.lora_linear_layer.up",
+    ".k_proj.lora_A": ".k_proj.lora_linear_layer.down",
+    ".v_proj.lora_B": ".v_proj.lora_linear_layer.up",
+    ".v_proj.lora_A": ".v_proj.lora_linear_layer.down",
+    ".out_proj.lora_B": ".out_proj.lora_linear_layer.up",
+    ".out_proj.lora_A": ".out_proj.lora_linear_layer.down",
+    "to_k.lora_A": "to_k.lora.down",
+    "to_k.lora_B": "to_k.lora.up",
+    "to_q.lora_A": "to_q.lora.down",
+    "to_q.lora_B": "to_q.lora.up",
+    "to_v.lora_A": "to_v.lora.down",
+    "to_v.lora_B": "to_v.lora.up",
+    "to_out.0.lora_A": "to_out.0.lora.down",
+    "to_out.0.lora_B": "to_out.0.lora.up",
+}
+
+DIFFUSERS_OLD_TO_DIFFUSERS = {
+    ".to_q_lora.up": ".q_proj.lora_linear_layer.up",
+    ".to_q_lora.down": ".q_proj.lora_linear_layer.down",
+    ".to_k_lora.up": ".k_proj.lora_linear_layer.up",
+    ".to_k_lora.down": ".k_proj.lora_linear_layer.down",
+    ".to_v_lora.up": ".v_proj.lora_linear_layer.up",
+    ".to_v_lora.down": ".v_proj.lora_linear_layer.down",
+    ".to_out_lora.up": ".out_proj.lora_linear_layer.up",
+    ".to_out_lora.down": ".out_proj.lora_linear_layer.down",
+}
+
+PEFT_TO_KOHYA_SS = {
+    "lora_A": "lora_down",
+    "lora_B": "lora_up",
+    # This is not a comprehensive dict as kohya format requires replacing `.` with `_` in keys,
+    # adding prefixes and adding alpha values
+    # Check `convert_state_dict_to_kohya` for more
+}
+
+PEFT_STATE_DICT_MAPPINGS = {
+    StateDictType.DIFFUSERS_OLD: DIFFUSERS_OLD_TO_PEFT,
+    StateDictType.DIFFUSERS: DIFFUSERS_TO_PEFT,
+}
+
+DIFFUSERS_STATE_DICT_MAPPINGS = {
+    StateDictType.DIFFUSERS_OLD: DIFFUSERS_OLD_TO_DIFFUSERS,
+    StateDictType.PEFT: PEFT_TO_DIFFUSERS,
+}
+
+KOHYA_STATE_DICT_MAPPINGS = {StateDictType.PEFT: PEFT_TO_KOHYA_SS}
+
+KEYS_TO_ALWAYS_REPLACE = {
+    ".processor.": ".",
+}
+
+def convert_state_dict(state_dict, mapping):
+    r"""
+    Simply iterates over the state dict and replaces the patterns in `mapping` with the corresponding values.
+
+    Args:
+        state_dict (`dict[str, torch.Tensor]`):
+            The state dict to convert.
+        mapping (`dict[str, str]`):
+            The mapping to use for conversion, the mapping should be a dictionary with the following structure:
+                - key: the pattern to replace
+                - value: the pattern to replace with
+
+    Returns:
+        converted_state_dict (`dict`)
+            The converted state dict.
+    """
+    converted_state_dict = {}
+    for k, v in state_dict.items():
+        # First, filter out the keys that we always want to replace
+        for pattern in KEYS_TO_ALWAYS_REPLACE.keys():
+            if pattern in k:
+                new_pattern = KEYS_TO_ALWAYS_REPLACE[pattern]
+                k = k.replace(pattern, new_pattern)
+
+        for pattern in mapping.keys():
+            if pattern in k:
+                new_pattern = mapping[pattern]
+                k = k.replace(pattern, new_pattern)
+                break
+        converted_state_dict[k] = v
+    return converted_state_dict
+
+
+
+def convert_unet_state_dict_to_peft(state_dict):
+    r"""
+    Converts a state dict from UNet format to diffusers format - i.e. by removing some keys
+    """
+    mapping = UNET_TO_DIFFUSERS
+    return convert_state_dict(state_dict, mapping)
+
+
+def convert_state_dict_to_peft(state_dict, original_type=None, **kwargs):
+    r"""
+    Converts a state dict to the PEFT format The state dict can be from previous diffusers format (`OLD_DIFFUSERS`), or
+    new diffusers format (`DIFFUSERS`). The method only supports the conversion from diffusers old/new to PEFT for now.
+
+    Args:
+        state_dict (`dict[str, torch.Tensor]`):
+            The state dict to convert.
+        original_type (`StateDictType`, *optional*):
+            The original type of the state dict, if not provided, the method will try to infer it automatically.
+    """
+    if original_type is None:
+        # Old diffusers to PEFT
+        if any("to_out_lora" in k for k in state_dict.keys()):
+            original_type = StateDictType.DIFFUSERS_OLD
+        elif any("lora_linear_layer" in k for k in state_dict.keys()):
+            original_type = StateDictType.DIFFUSERS
+        else:
+            raise ValueError("Could not automatically infer state dict type")
+
+    if original_type not in PEFT_STATE_DICT_MAPPINGS.keys():
+        raise ValueError(f"Original type {original_type} is not supported")
+
+    mapping = PEFT_STATE_DICT_MAPPINGS[original_type]
+    return convert_state_dict(state_dict, mapping)
+
+
+def convert_state_dict_to_diffusers(state_dict, original_type=None, **kwargs):
+    r"""
+    Converts a state dict to new diffusers format. The state dict can be from previous diffusers format
+    (`OLD_DIFFUSERS`), or PEFT format (`PEFT`) or new diffusers format (`DIFFUSERS`). In the last case the method will
+    return the state dict as is.
+
+    The method only supports the conversion from diffusers old, PEFT to diffusers new for now.
+
+    Args:
+        state_dict (`dict[str, torch.Tensor]`):
+            The state dict to convert.
+        original_type (`StateDictType`, *optional*):
+            The original type of the state dict, if not provided, the method will try to infer it automatically.
+        kwargs (`dict`, *args*):
+            Additional arguments to pass to the method.
+
+            - **adapter_name**: For example, in case of PEFT, some keys will be pre-pended
+                with the adapter name, therefore needs a special handling. By default PEFT also takes care of that in
+                `get_peft_model_state_dict` method:
+                https://github.com/huggingface/peft/blob/ba0477f2985b1ba311b83459d29895c809404e99/src/peft/utils/save_and_load.py#L92
+                but we add it here in case we don't want to rely on that method.
+    """
+    peft_adapter_name = kwargs.pop("adapter_name", None)
+    if peft_adapter_name is not None:
+        peft_adapter_name = "." + peft_adapter_name
+    else:
+        peft_adapter_name = ""
+
+    if original_type is None:
+        # Old diffusers to PEFT
+        if any("to_out_lora" in k for k in state_dict.keys()):
+            original_type = StateDictType.DIFFUSERS_OLD
+        elif any(f".lora_A{peft_adapter_name}.weight" in k for k in state_dict.keys()):
+            original_type = StateDictType.PEFT
+        elif any("lora_linear_layer" in k for k in state_dict.keys()):
+            # nothing to do
+            return state_dict
+        else:
+            raise ValueError("Could not automatically infer state dict type")
+
+    if original_type not in DIFFUSERS_STATE_DICT_MAPPINGS.keys():
+        raise ValueError(f"Original type {original_type} is not supported")
+
+    mapping = DIFFUSERS_STATE_DICT_MAPPINGS[original_type]
+    return convert_state_dict(state_dict, mapping)
+
+
+def cast_training_params(model: Union[torch.nn.Module, List[torch.nn.Module]], dtype=torch.float32):
+    if not isinstance(model, list):
+        model = [model]
+    for m in model:
+        for param in m.parameters():
+            # only upcast trainable parameters into fp32
+            if param.requires_grad:
+                param.data = param.to(dtype)
+
+
+def _set_state_dict_into_text_encoder(
+    lora_state_dict: Dict[str, torch.Tensor], prefix: str, text_encoder: torch.nn.Module
+):
+    """
+    Sets the `lora_state_dict` into `text_encoder` coming from `transformers`.
+
+    Args:
+        lora_state_dict: The state dictionary to be set.
+        prefix: String identifier to retrieve the portion of the state dict that belongs to `text_encoder`.
+        text_encoder: Where the `lora_state_dict` is to be set.
+    """
+
+    text_encoder_state_dict = {
+        f'{k.replace(prefix, "")}': v for k, v in lora_state_dict.items() if k.startswith(prefix)
+    }
+    text_encoder_state_dict = convert_state_dict_to_peft(convert_state_dict_to_diffusers(text_encoder_state_dict))
+    set_peft_model_state_dict(text_encoder, text_encoder_state_dict, adapter_name="default")
 
 
 def prepare_mask_and_masked_image(image, mask):
@@ -116,8 +367,8 @@ def parse_args():
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default="stabilityai/stable-diffusion-2-inpainting",
-        required=False, # True
+        default=None,
+        required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
@@ -129,8 +380,8 @@ def parse_args():
     parser.add_argument(
         "--instance_data_dir",
         type=str,
-        default=r"C:\Users\smanjun3\Desktop\FashionXchange\text2human\images",
-        required=False, #True,
+        default=None,
+        required=True,
         help="A folder containing the training data of instance images.",
     )
     parser.add_argument(
@@ -140,6 +391,7 @@ def parse_args():
         required=False,
         help="A folder containing the training data of class images.",
     )
+  
     parser.add_argument(
         "--with_prior_preservation",
         default=False,
@@ -150,7 +402,7 @@ def parse_args():
     parser.add_argument(
         "--num_class_images",
         type=int,
-        default=28, #100,
+        default=100,
         help=(
             "Minimal class images for prior preservation loss. If not have enough images, additional images will be"
             " sampled with class_prompt."
@@ -159,7 +411,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="text-inversion-model",
+        default="dreambooth-inpaint-model",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
@@ -297,32 +549,14 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--class_images_generation_prompts_file",
-        type=str,
-        default=None,
-        help=(
-            """File containig=ng the prompts for generating class images using pre-trained Stable 
-            Diffusion Inpaintnig model for prior preservation loss"""
-        ),
+        "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
     )
     parser.add_argument(
-        "--instance_image_captions_file",
-        type=str,
-        default=r"C:\Users\smanjun3\Desktop\FashionXchange\text2human\masked_image_captions.json",
-        required=False, #True,
-        help=(
-            "Path to json/yaml/text file containig the text prompts for the instance images"
-        )    
+        "--rank",
+        type=int,
+        default=4,
+        help=("The dimension of the LoRA update matrices."),
     )
-    parser.add_argument(
-        "--class_image_captions_file",
-        type=str,
-        default=None,
-        help=(
-            "Path to json/yaml/text file containig the text prompts for the class images"
-        )
-    )
-
     parser.add_argument(
         "--pipeline_checkpointing_steps",
         type=int,
@@ -338,13 +572,30 @@ def parse_args():
         default=None,
         help="The output directory where the pipeline weights will be stored",
     )
-
     parser.add_argument(
         "--instance_images_mask_dir",
         type=str,
         default=r"C:\Users\smanjun3\Desktop\FashionXchange\text2human\Masks",
         help="The directory where the instance image masks are stored",
     )
+    parser.add_argument(
+        "--class_image_captions_file",
+        type=str,
+        default=None,
+        help=(
+            "Path to json/yaml/text file containig the text prompts for the class images"
+        )
+    )
+    parser.add_argument(
+        "--instance_image_captions_file",
+        type=str,
+        default=r"C:\Users\smanjun3\Desktop\FashionXchange\text2human\masked_image_captions.json",
+        required=False, #True,
+        help=(
+            "Path to json/yaml/text file containig the text prompts for the instance images"
+        )    
+    )
+    
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -357,64 +608,53 @@ def parse_args():
     if args.with_prior_preservation:
         if args.class_data_dir is None:
             raise ValueError("You must specify a data directory for class images.")
-        # if args.class_prompt is None:
-        #     raise ValueError("You must specify prompt for class images.")
 
     return args
 
 
-class ClassDatasetSampleGeneraion(Dataset):
-    "A simple dataset to prepare the prompts to generate class images on multiple GPUs."
+class DreamBoothDataset(Dataset):
+    """
+    A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
+    It pre-processes the images and the tokenizes prompts.
+    """
 
-    def __init__(self, prompts_for_generation_path):
-        self.prompt_list = text_file_reader(prompts_for_generation_path)
-
-    def __len__(self):
-        return len(self.prompt_list)
-
-    def __getitem__(self, index):
-        example = {}
-        example["prompt"] = self.prompt_list[index]
-        example["index"] = index
-        return example
-
-
-class TrainDataset(Dataset):
     def __init__(
-            self, 
-            instance_image_captions_file, 
-            instance_image_dir, 
-            tokenizer,
-            image_size=512, 
-            center_crop=False, 
-            class_image_dir=None, 
-            class_image_prompts_file=None, 
-            class_sample_generated_prompts=None):
-        
+        self,
+        instance_data_root,
+        instance_prompt,
+        tokenizer,
+        class_data_root=None,
+        class_prompt=None,
+        size=512,
+        center_crop=False,
+    ):
+        self.size = size
+        self.center_crop = center_crop
         self.tokenizer = tokenizer
-        self.instance_image_captions = self.caption_file_reader(instance_image_captions_file)
-        self._length = len(self.instance_image_captions.keys())
-        # self.instance_image_list = glob(os.path.join(instance_image_dir, '*.jpg'))
-        self.instance_image_list = [os.path.join(instance_image_dir, image_file) for image_file in self.instance_image_captions.keys()]
 
-        if class_image_prompts_file is not None:
-            self.class_image_captions = self.caption_file_reader(class_image_prompts_file)
+        self.instance_data_root = Path(instance_data_root)
+        if not self.instance_data_root.exists():
+            raise ValueError("Instance images root doesn't exists.")
+
+        self.instance_images_path = list(Path(instance_data_root).iterdir())
+        self.num_instance_images = len(self.instance_images_path)
+        self.instance_prompt = instance_prompt
+        self._length = self.num_instance_images
+
+        if class_data_root is not None:
+            self.class_data_root = Path(class_data_root)
+            self.class_data_root.mkdir(parents=True, exist_ok=True)
+            self.class_images_path = list(self.class_data_root.iterdir())
+            self.num_class_images = len(self.class_images_path)
+            self._length = max(self.num_class_images, self.num_instance_images)
+            self.class_prompt = class_prompt
         else:
-            self.class_image_captions = dict()
-
-        if class_sample_generated_prompts is not None:
-            self.class_image_captions.update(class_sample_generated_prompts)
-       
-
-        if class_image_dir is not None:
-            self.class_image_list = glob(os.path.join(class_image_dir, '*.jpeg'))
-        else:
-            self.class_image_list = None
+            self.class_data_root = None
 
         self.image_transforms_resize_and_crop = transforms.Compose(
             [
-                transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BILINEAR),
-                transforms.CenterCrop(image_size) if center_crop else transforms.RandomCrop(image_size),
+                transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
+                transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
             ]
         )
 
@@ -427,165 +667,57 @@ class TrainDataset(Dataset):
 
     def __len__(self):
         return self._length
-    
-    @staticmethod
-    def caption_file_reader(captions_file_path, image_directory=None):
-        ext = os.path.splitext(captions_file_path)[1]
-        if captions_file_path.endswith(".txt"):
-            assert image_directory is not None
-            captions = text_file_reader(captions_file_path)
-            image_vs_captions = dict()
-            img_list = glob(os.path.join(image_directory, '*.jpg'))
-            for img_path, caption in zip(img_list, captions):
-                img_name = os.path.basename(img_path)
-                image_vs_captions[img_name] = caption
-            return image_vs_captions
-        elif captions_file_path.endswith(".json"):
-            """
-            Code for creating a dictionary of image_name vs captions by reading a json file 
-            """
-            with open(captions_file_path, "r") as json_file:
-                image_vs_captions = json.load(json_file)
-            return image_vs_captions
 
-        elif captions_file_path.endswith(".yaml"):
-            """
-            Code for creating a dictionary of image_name vs captions by reading a yaml file 
-            """
-            pass
-
-    def __getitem__(self, idx):
-        example = dict()
-        image_name = os.path.basename(self.instance_image_list[idx])
-        instance_image = Image.open(self.instance_image_list[idx])
+    def __getitem__(self, index):
+        example = {}
+        instance_image = Image.open(self.instance_images_path[index % self.num_instance_images])
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
         instance_image = self.image_transforms_resize_and_crop(instance_image)
+
         example["PIL_images"] = instance_image
         example["instance_images"] = self.image_transforms(instance_image)
+
         example["instance_prompt_ids"] = self.tokenizer(
-            self.instance_image_captions[image_name],
+            self.instance_prompt,
             padding="do_not_pad",
             truncation=True,
             max_length=self.tokenizer.model_max_length,
         ).input_ids
-        if self.class_image_list is not None:
-            class_image_name = os.path.basename(self.class_image_list[idx])
-            class_image = Image.open(self.class_image_list[idx])
+
+        if self.class_data_root:
+            class_image = Image.open(self.class_images_path[index % self.num_class_images])
             if not class_image.mode == "RGB":
                 class_image = class_image.convert("RGB")
             class_image = self.image_transforms_resize_and_crop(class_image)
             example["class_images"] = self.image_transforms(class_image)
             example["class_PIL_images"] = class_image
             example["class_prompt_ids"] = self.tokenizer(
-                self.class_image_captions[class_image_name],
+                self.class_prompt,
                 padding="do_not_pad",
                 truncation=True,
                 max_length=self.tokenizer.model_max_length,
             ).input_ids
+
         return example
-
-
-class TargetedMaskingDataset(Dataset):
-    def __init__(self, 
-                instance_image_captions_file, 
-                instance_image_dir,
-                instance_images_mask_dir, 
-                tokenizer,
-                image_size=512):
-        self.tokenizer = tokenizer
-        self.instance_image_captions = self.caption_file_reader(instance_image_captions_file)
-        self.mask_directory = instance_images_mask_dir
-        self.instance_image_list = [os.path.join(instance_image_dir, image_file) for image_file in self.instance_image_captions.keys()]
-        self.image_transforms_resize = transforms.Compose(
-            [
-                transforms.Resize((image_size, image_size), interpolation=transforms.InterpolationMode.BILINEAR),
-                # transforms.CenterCrop(image_size)
-            ]
-        )
-        self.image_transforms_resize2 = transforms.Compose(
-            [
-                transforms.Resize((image_size, image_size), interpolation=transforms.InterpolationMode.NEAREST),
-                # transforms.CenterCrop(image_size)
-            ]
-        )
-        self.image_transforms = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5]),
-            ]
-        )
-
-    def __len__(self):
-        return len(self.instance_image_captions)
-
-    @staticmethod
-    def caption_file_reader(captions_file_path, image_directory=None):
-        ext = os.path.splitext(captions_file_path)[1]
-        if captions_file_path.endswith(".txt"):
-            assert image_directory is not None
-            captions = text_file_reader(captions_file_path)
-            image_vs_captions = dict()
-            img_list = glob(os.path.join(image_directory, '*.jpg'))
-            for img_path, caption in zip(img_list, captions):
-                img_name = os.path.basename(img_path)
-                image_vs_captions[img_name] = caption
-            return image_vs_captions
-        elif captions_file_path.endswith(".json"):
-            """
-            Code for creating a dictionary of image_name vs captions by reading a json file 
-            """
-            with open(captions_file_path, "r") as json_file:
-                image_vs_captions = json.load(json_file)
-            return image_vs_captions
-
-        elif captions_file_path.endswith(".yaml"):
-            """
-            Code for creating a dictionary of image_name vs captions by reading a yaml file 
-            """
-            pass
-    
-    def __getitem__(self, idx):
-        example = dict()
-        image_name = os.path.basename(self.instance_image_list[idx])
-        instance_image = Image.open(self.instance_image_list[idx])
-        mask_paths = os.listdir(os.path.join(self.mask_directory, image_name.split(".")[0]))
-        if not instance_image.mode == "RGB":
-            instance_image = instance_image.convert("RGB")
-        random_selector = np.random.randint(0, len(mask_paths))
-        # print(mask_paths[random_selector])
-        selected_mask = Image.open(os.path.join(self.mask_directory, os.path.join(image_name.split(".jpg")[0], mask_paths[random_selector])))
-        example["mask"] = self.image_transforms_resize2(selected_mask)
-        instance_image = self.image_transforms_resize(instance_image)
-        example["PIL_image"] = instance_image
-        example["instance_image"] = self.image_transforms(instance_image)
-        example["instance_prompt_ids"] = self.tokenizer(
-            self.instance_image_captions[image_name],
-            padding="do_not_pad",
-            truncation=True,
-            max_length=self.tokenizer.model_max_length,
-        ).input_ids
-        return example
-
 
 class TargetedMaskingDatasetWithPriorPreservation(Dataset):
-    def __init__(self, 
-                instance_image_captions_file, 
+    def __init__(self,
+                instance_image_captions_file,
                 instance_image_dir,
-                instance_images_mask_dir, 
+                instance_images_mask_dir,
                 class_images_dir,
                 class_image_captions_file,
                 tokenizer,
                 image_size=512):
         self.tokenizer = tokenizer
-        self.instance_image_captions = self.caption_file_reader(instance_image_captions_file)
+        blip_instance_image_captions = self.caption_file_reader(instance_image_captions_file)
         self.mask_directory = instance_images_mask_dir
-        self.instance_images_mask_list = os.listdir(self.mask_directory)
-        self.instance_image_captions_updated = dict()
-        for i in self.instance_images_mask_list:
-            self.instance_image_captions_updated[i] = self.instance_image_captions[i]
-        self.instance_image_captions = self.instance_image_captions_updated
-        self.instance_image_list = [os.path.join(instance_image_dir, image_file + '.jpg') for image_file in self.instance_image_captions.keys()]
+        available_masks= self.caption_file_reader(r"C:\Users\smanjun3\Desktop\FashionXchange\text2human\generated_masks_captions.json")
+        # available_masks_list =[key.strip('.jpg') for key in available_masks.keys()]
+        available_masks_list=os.listdir(r"C:\Users\smanjun3\Desktop\FashionXchange\text2human\masks")
+        self.instance_image_captions={key: blip_instance_image_captions[key]+available_masks[key+'.jpg'] for key in blip_instance_image_captions.keys() and available_masks_list}
+        self.instance_image_list = [os.path.join(instance_image_dir, image_file+'.jpg') for image_file in self.instance_image_captions.keys() and available_masks_list]
         self.class_image_captions = self.caption_file_reader(class_image_captions_file)
         self.class_image_list = [os.path.join(class_images_dir, image_file) for image_file in self.class_image_captions.keys()]
         if len(self.class_image_list) > len(self.instance_image_list):
@@ -594,13 +726,13 @@ class TargetedMaskingDatasetWithPriorPreservation(Dataset):
             required_samples_count = len(self.instance_image_list) - len(self.class_image_list)
             while required_samples_count > 0:
                 if required_samples_count > len(self.class_image_list):
-                    class_image_list = random.sample(self.class_image_list, len(self.class_image_list))
-                    required_samples_count -= (len(self.class_image_list))
+                    class_image_list = random.sample(self.class_image_list, len(self.class_image_list) - 1)
+                    required_samples_count -= (len(self.class_image_list) - 1)
                 else:
                     class_image_list = random.sample(self.class_image_list, required_samples_count)
                     required_samples_count = 0
                 self.class_image_list.extend(class_image_list)
-    
+        
         assert len(self.class_image_list)==len(self.instance_image_list)
 
         self.image_transforms_resize_and_crop = transforms.Compose(
@@ -609,7 +741,7 @@ class TargetedMaskingDatasetWithPriorPreservation(Dataset):
                 transforms.RandomCrop(image_size),
             ]
         )
-        
+
         self.image_transforms_resize = transforms.Compose(
             [
                 transforms.Resize((image_size, image_size), interpolation=transforms.InterpolationMode.BILINEAR),
@@ -630,7 +762,7 @@ class TargetedMaskingDatasetWithPriorPreservation(Dataset):
         )
 
     def __len__(self):
-        return len(self.instance_image_captions)
+        return len(self.instance_image_list)
 
     @staticmethod
     def caption_file_reader(captions_file_path, image_directory=None):
@@ -646,7 +778,7 @@ class TargetedMaskingDatasetWithPriorPreservation(Dataset):
             return image_vs_captions
         elif captions_file_path.endswith(".json"):
             """
-            Code for creating a dictionary of image_name vs captions by reading a json file 
+            Code for creating a dictionary of image_name vs captions by reading a json file
             """
             with open(captions_file_path, "r") as json_file:
                 image_vs_captions = json.load(json_file)
@@ -654,7 +786,7 @@ class TargetedMaskingDatasetWithPriorPreservation(Dataset):
 
         elif captions_file_path.endswith(".yaml"):
             """
-            Code for creating a dictionary of image_name vs captions by reading a yaml file 
+            Code for creating a dictionary of image_name vs captions by reading a yaml file
             """
             pass
         elif captions_file_path.endswith(".token"):
@@ -668,7 +800,7 @@ class TargetedMaskingDatasetWithPriorPreservation(Dataset):
                     continue
                 image_vs_caption[image_name] = caption
             return image_vs_caption
-    
+
     def __getitem__(self, idx):
         example = dict()
         image_name = os.path.basename(self.instance_image_list[idx])
@@ -703,7 +835,7 @@ class TargetedMaskingDatasetWithPriorPreservation(Dataset):
             max_length=self.tokenizer.model_max_length,
         ).input_ids
         return example
-          
+
 
 def random_perturb_mask(mask):
     ones = np.where(mask > 0)
@@ -743,20 +875,37 @@ def random_perturb_mask(mask):
     return mask
 
 
-def model_finetuning():
+
+class PromptDataset(Dataset):
+    "A simple dataset to prepare the prompts to generate class images on multiple GPUs."
+
+    def __init__(self, prompt, num_samples):
+        self.prompt = prompt
+        self.num_samples = num_samples
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, index):
+        example = {}
+        example["prompt"] = self.prompt
+        example["index"] = index
+        return example
+
+
+def main():
     args = parse_args()
     logging_dir = Path(args.output_dir, args.logging_dir)
 
-    args.train_text_encoder = True
-
-    project_config = ProjectConfiguration(
+    accelerator_project_config = ProjectConfiguration(
         total_limit=args.checkpoints_total_limit, project_dir=args.output_dir, logging_dir=logging_dir
     )
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with="tensorboard",
-        project_config=project_config,
+        project_config=accelerator_project_config,
     )
 
     # Currently, it's not possible to do gradient accumulation when training two models with accelerate.accumulate
@@ -771,44 +920,50 @@ def model_finetuning():
     if args.seed is not None:
         set_seed(args.seed)
 
-    if args.with_prior_preservation and args.class_images_generation_prompts_file:
-        torch_dtype = torch.float16 if accelerator.device.type == "cuda" else torch.float32
-        pipeline = StableDiffusionInpaintPipeline.from_pretrained(
-            args.pretrained_model_name_or_path, torch_dtype=torch_dtype, safety_checker=None
-        )
-        pipeline.set_progress_bar_config(disable=True)
-        sample_dataset = ClassDatasetSampleGeneraion(args.class_images_generation_prompts_file)
-        logger.info(f"Number of class images to sample: {len(sample_dataset)}.")
-        sample_dataloader = torch.utils.data.DataLoader(
-            sample_dataset, batch_size=args.sample_batch_size, num_workers=1
-        )
+    # if args.with_prior_preservation:
+    #     class_images_dir = Path(args.class_data_dir)
+    #     if not class_images_dir.exists():
+    #         class_images_dir.mkdir(parents=True)
+    #     cur_class_images = len(list(class_images_dir.iterdir()))
 
-        sample_dataloader = accelerator.prepare(sample_dataloader)
-        pipeline.to(accelerator.device)
-        transform_to_pil = transforms.ToPILImage()
-        for j, example in tqdm(
-            enumerate(sample_dataloader), desc="Generating class images", disable=not accelerator.is_local_main_process
-        ):
-            bsz = len(example["prompt"])
-            fake_images = torch.rand((3, args.resolution, args.resolution))
-            transform_to_pil = transforms.ToPILImage()
-            fake_pil_images = transform_to_pil(fake_images)
+    #     if cur_class_images < args.num_class_images:
+    #         torch_dtype = torch.float16 if accelerator.device.type == "cuda" else torch.float32
+    #         pipeline = StableDiffusionInpaintPipeline.from_pretrained(
+    #             args.pretrained_model_name_or_path, torch_dtype=torch_dtype, safety_checker=None
+    #         )
+    #         pipeline.set_progress_bar_config(disable=True)
 
-            fake_mask = random_mask((args.resolution, args.resolution), ratio=1, mask_full_image=True)
+    #         num_new_images = args.num_class_images - cur_class_images
+    #         logger.info(f"Number of class images to sample: {num_new_images}.")
 
-            images = pipeline(prompt=example["prompt"], mask_image=fake_mask, image=fake_pil_images).images
-            sample_img_names_prompts = dict()
-            for i, image in enumerate(images):
-                hash_image = insecure_hashlib.sha1(image.tobytes()).hexdigest()
-                image_filename = args.class_images_dir / f"{example['index'][i]}-{hash_image}.jpg"
-                sample_img_names_prompts[f"{example['index'][i]}-{hash_image}.jpg"] = example["prompt"][i]
-                image.save(image_filename)
-        del pipeline
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    
-    else:
-        sample_img_names_prompts = dict()
+    #         sample_dataset = PromptDataset(args.class_prompt, num_new_images)
+    #         sample_dataloader = torch.utils.data.DataLoader(
+    #             sample_dataset, batch_size=args.sample_batch_size, num_workers=1
+    #         )
+
+    #         sample_dataloader = accelerator.prepare(sample_dataloader)
+    #         pipeline.to(accelerator.device)
+    #         transform_to_pil = transforms.ToPILImage()
+    #         for example in tqdm(
+    #             sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
+    #         ):
+    #             bsz = len(example["prompt"])
+    #             fake_images = torch.rand((3, args.resolution, args.resolution))
+    #             transform_to_pil = transforms.ToPILImage()
+    #             fake_pil_images = transform_to_pil(fake_images)
+
+    #             fake_mask = random_mask((args.resolution, args.resolution), ratio=1, mask_full_image=True)
+
+    #             images = pipeline(prompt=example["prompt"], mask_image=fake_mask, image=fake_pil_images).images
+
+    #             for i, image in enumerate(images):
+    #                 hash_image = insecure_hashlib.sha1(image.tobytes()).hexdigest()
+    #                 image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
+    #                 image.save(image_filename)
+
+    #         del pipeline
+    #         if torch.cuda.is_available():
+    #             torch.cuda.empty_cache()
 
     # Handle the repository creation
     if accelerator.is_main_process:
@@ -831,14 +986,157 @@ def model_finetuning():
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
     unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
 
+    # We only train the additional adapter LoRA layers
     vae.requires_grad_(False)
-    if not args.train_text_encoder:
-        text_encoder.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+    unet.requires_grad_(False)
 
-    if args.gradient_checkpointing:
-        unet.enable_gradient_checkpointing()
+    weight_dtype = torch.float32
+    if args.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif args.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
+    # Move text_encode and vae to gpu.
+    # For mixed precision training we cast the text_encoder and vae weights to half-precision
+    # as these models are only used for inference, keeping weights in full precision is not required.
+    unet.to(accelerator.device, dtype=weight_dtype)
+    vae.to(accelerator.device, dtype=weight_dtype)
+    text_encoder.to(accelerator.device, dtype=weight_dtype)
+
+    if args.enable_xformers_memory_efficient_attention:
+        if is_xformers_available():
+            unet.enable_xformers_memory_efficient_attention()
+        else:
+            raise ValueError("xformers is not available. Make sure it is installed correctly")
+
+    # now we will add new LoRA weights to the attention layers
+    # It's important to realize here how many attention weights will be added and of which sizes
+    # The sizes of the attention layers consist only of two different variables:
+    # 1) - the "hidden_size", which is increased according to `unet.config.block_out_channels`.
+    # 2) - the "cross attention size", which is set to `unet.config.cross_attention_dim`.
+
+    # Let's first see how many attention processors we will have to set.
+    # For Stable Diffusion, it should be equal to:
+    # - down blocks (2x attention layers) * (2x transformer layers) * (3x down blocks) = 12
+    # - mid blocks (2x attention layers) * (1x transformer layers) * (1x mid blocks) = 2
+    # - up blocks (2x attention layers) * (3x transformer layers) * (3x down blocks) = 18
+    # => 32 layers
+
+    # Set correct lora layers
+    # lora_attn_procs = {}
+    # for name in unet.attn_processors.keys():
+    #     cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
+    #     if name.startswith("mid_block"):
+    #         hidden_size = unet.config.block_out_channels[-1]
+    #     elif name.startswith("up_blocks"):
+    #         block_id = int(name[len("up_blocks.")])
+    #         hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
+    #     elif name.startswith("down_blocks"):
+    #         block_id = int(name[len("down_blocks.")])
+    #         hidden_size = unet.config.block_out_channels[block_id]
+
+    #     lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
+
+    # unet.set_attn_processor(lora_attn_procs)
+    # lora_layers = AttnProcsLayers(unet.attn_processors)
+
+    # accelerator.register_for_checkpointing(lora_layers)
+    unet_lora_config = LoraConfig(
+        r=args.rank,
+        lora_alpha=args.rank,
+        init_lora_weights="gaussian",
+        target_modules=["to_k", "to_q", "to_v", "to_out.0", "add_k_proj", "add_v_proj"],
+    )
+    unet.add_adapter(unet_lora_config)
+
+    if args.train_text_encoder:
+        text_lora_config = LoraConfig(
+            r=args.rank,
+            lora_alpha=args.rank,
+            init_lora_weights="gaussian",
+            target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
+        )
+        text_encoder.add_adapter(text_lora_config)
+
+    def unwrap_model(model):
+        model = accelerator.unwrap_model(model)
+        model = model._orig_mod if is_compiled_module(model) else model
+        return model
+
+
+    def save_model_hook(models, weights, output_dir):
+        if accelerator.is_main_process:
+            # there are only two options here. Either are just the unet attn processor layers
+            # or there are the unet and text encoder atten layers
+            unet_lora_layers_to_save = None
+            text_encoder_lora_layers_to_save = None
+
+            for model in models:
+                if isinstance(model, type(unwrap_model(unet))):
+                    unet_lora_layers_to_save = convert_state_dict_to_diffusers(get_peft_model_state_dict(model))
+                elif isinstance(model, type(unwrap_model(text_encoder))):
+                    text_encoder_lora_layers_to_save = convert_state_dict_to_diffusers(
+                        get_peft_model_state_dict(model)
+                    )
+                else:
+                    raise ValueError(f"unexpected save model: {model.__class__}")
+
+                # make sure to pop weight so that corresponding model is not saved again
+                weights.pop()
+
+            LoraLoaderMixin.save_lora_weights(
+                output_dir,
+                unet_lora_layers=unet_lora_layers_to_save,
+                text_encoder_lora_layers=text_encoder_lora_layers_to_save,
+            )
+
+    def load_model_hook(models, input_dir):
+        unet_ = None
+        text_encoder_ = None
+
+        while len(models) > 0:
+            model = models.pop()
+
+            if isinstance(model, type(unwrap_model(unet))):
+                unet_ = model
+            elif isinstance(model, type(unwrap_model(text_encoder))):
+                text_encoder_ = model
+            else:
+                raise ValueError(f"unexpected save model: {model.__class__}")
+
+        lora_state_dict, network_alphas = LoraLoaderMixin.lora_state_dict(input_dir)
+
+        unet_state_dict = {f'{k.replace("unet.", "")}': v for k, v in lora_state_dict.items() if k.startswith("unet.")}
+        unet_state_dict = convert_unet_state_dict_to_peft(unet_state_dict)
+        incompatible_keys = set_peft_model_state_dict(unet_, unet_state_dict, adapter_name="default")
+
+        if incompatible_keys is not None:
+            # check only for unexpected keys
+            unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
+            if unexpected_keys:
+                logger.warning(
+                    f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
+                    f" {unexpected_keys}. "
+                )
+
         if args.train_text_encoder:
-            text_encoder.gradient_checkpointing_enable()
+            _set_state_dict_into_text_encoder(lora_state_dict, prefix="text_encoder.", text_encoder=text_encoder_)
+
+        # Make sure the trainable params are in float32. This is again needed since the base models
+        # are in `weight_dtype`. More details:
+        # https://github.com/huggingface/diffusers/pull/6514#discussion_r1449796804
+        if args.mixed_precision == "fp16":
+            models = [unet_]
+            if args.train_text_encoder:
+                models.append(text_encoder_)
+
+            # only upcast trainable parameters (LoRA) into fp32
+            cast_training_params(models, dtype=torch.float32)
+
+    accelerator.register_save_state_pre_hook(save_model_hook)
+    accelerator.register_load_state_pre_hook(load_model_hook)
+
 
     if args.scale_lr:
         args.learning_rate = (
@@ -858,9 +1156,18 @@ def model_finetuning():
     else:
         optimizer_class = torch.optim.AdamW
 
-    params_to_optimize = (
-        itertools.chain(unet.parameters(), text_encoder.parameters()) if args.train_text_encoder else unet.parameters()
-    )
+    # optimizer = optimizer_class(
+    #     lora_layers.parameters(),
+    #     lr=args.learning_rate,
+    #     betas=(args.adam_beta1, args.adam_beta2),
+    #     weight_decay=args.adam_weight_decay,
+    #     eps=args.adam_epsilon,
+    # )
+    # Optimizer creation
+    params_to_optimize = list(filter(lambda p: p.requires_grad, unet.parameters()))
+    if args.train_text_encoder:
+        params_to_optimize = params_to_optimize + list(filter(lambda p: p.requires_grad, text_encoder.parameters()))
+
     optimizer = optimizer_class(
         params_to_optimize,
         lr=args.learning_rate,
@@ -869,17 +1176,19 @@ def model_finetuning():
         eps=args.adam_epsilon,
     )
 
+
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
     if args.instance_images_mask_dir is None:
-        train_dataset = TrainDataset(instance_image_captions_file=args.instance_image_captions_file,
-                                    instance_image_dir=args.instance_data_dir,
-                                    image_size=args.resolution,
-                                    tokenizer=tokenizer,
-                                    center_crop=args.center_crop,
-                                    class_image_dir=args.class_data_dir,
-                                    class_image_prompts_file=args.class_image_captions_file,
-                                    class_sample_generated_prompts=sample_img_names_prompts)
+        train_dataset = DreamBoothDataset(
+            instance_data_root=args.instance_data_dir,
+            instance_prompt=args.instance_prompt,
+            class_data_root=args.class_data_dir if args.with_prior_preservation else None,
+            class_prompt=args.class_prompt,
+            tokenizer=tokenizer,
+            size=args.resolution,
+            center_crop=args.center_crop,
+        )
 
         def collate_fn(examples):
             input_ids = [example["instance_prompt_ids"] for example in examples]
@@ -922,7 +1231,6 @@ def model_finetuning():
             masked_images = torch.stack(masked_images)
             batch = {"input_ids": input_ids, "pixel_values": pixel_values, "masks": masks, "masked_images": masked_images}
             return batch
-    
     elif args.instance_images_mask_dir is not None and args.with_prior_preservation:
         print("Inside Traget Masking Dataset with prior loss")
         train_dataset = TargetedMaskingDatasetWithPriorPreservation(
@@ -973,40 +1281,6 @@ def model_finetuning():
             batch = {"input_ids": input_ids, "pixel_values": pixel_values, "masks": masks, "masked_images": masked_images}
             return batch    
 
-    else:
-        train_dataset = TargetedMaskingDataset(instance_image_captions_file=args.instance_image_captions_file, 
-                                               instance_image_dir=args.instance_data_dir,
-                                               instance_images_mask_dir=args.instance_images_mask_dir, 
-                                               tokenizer=tokenizer,
-                                               image_size=args.resolution)
-
-        def collate_fn(examples):
-            input_ids = [example["instance_prompt_ids"] for example in examples]
-            pixel_values = [example["instance_image"] for example in examples]
-            masks = []
-            masked_images = []
-            for example in examples:
-                pil_image = np.array(example["PIL_image"])
-                mask = np.array(example["mask"])
-                mask = random_perturb_mask(mask)
-                image = torch.from_numpy(pil_image).to(dtype=torch.float32) / 127.5 - 1.0
-                mask = torch.from_numpy(mask)
-                mask = mask.unsqueeze(2)
-                masked_image = image * (mask.expand(-1, -1, 3) == 0)
-                masked_image = masked_image.permute(2, 0, 1)
-                mask = mask.permute(2, 0, 1)
-                masks.append(mask)
-                masked_images.append(masked_image)
-            pixel_values = torch.stack(pixel_values)
-            pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-            input_ids = tokenizer.pad({"input_ids": input_ids}, padding=True, return_tensors="pt").input_ids
-            masks = torch.stack(masks)
-            masked_images = torch.stack(masked_images)
-            batch = {"input_ids": input_ids, "pixel_values": pixel_values, "masks": masks, "masked_images": masked_images}
-            return batch
-    
-    print(f"Training dataset of {len(train_dataset)} images loaded")
-
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.train_batch_size, shuffle=True, collate_fn=collate_fn
     )
@@ -1025,6 +1299,11 @@ def model_finetuning():
         num_training_steps=args.max_train_steps * accelerator.num_processes,
     )
 
+    # Prepare everything with our `accelerator`.
+    # lora_layers, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+    #     lora_layers, optimizer, train_dataloader, lr_scheduler
+    # )
+        # Prepare everything with our `accelerator`.
     if args.train_text_encoder:
         unet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             unet, text_encoder, optimizer, train_dataloader, lr_scheduler
@@ -1033,20 +1312,7 @@ def model_finetuning():
         unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             unet, optimizer, train_dataloader, lr_scheduler
         )
-    accelerator.register_for_checkpointing(lr_scheduler)
-
-    weight_dtype = torch.float32
-    if args.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif args.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
-
-    # Move text_encode and vae to gpu.
-    # For mixed precision training we cast the text_encoder and vae weights to half-precision
-    # as these models are only used for inference, keeping weights in full precision is not required.
-    vae.to(accelerator.device, dtype=weight_dtype)
-    if not args.train_text_encoder:
-        text_encoder.to(accelerator.device, dtype=weight_dtype)
+    # accelerator.register_for_checkpointing(lr_scheduler)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1058,7 +1324,7 @@ def model_finetuning():
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        accelerator.init_trackers("dreambooth", config=vars(args))
+        accelerator.init_trackers("dreambooth-inpaint-lora", config=vars(args))
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -1104,6 +1370,8 @@ def model_finetuning():
 
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
+        if args.train_text_encoder:
+            text_encoder.train()
         for step, batch in enumerate(train_dataloader):
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
@@ -1130,7 +1398,7 @@ def model_finetuning():
                         torch.nn.functional.interpolate(mask.unsqueeze(0), size=(args.resolution // 8, args.resolution // 8))
                         for mask in masks
                     ]
-                )
+                ).to(dtype=weight_dtype)
                 mask = mask.reshape(-1, 1, args.resolution // 8, args.resolution // 8)
 
                 # Sample noise that we'll add to the latents
@@ -1179,11 +1447,7 @@ def model_finetuning():
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    params_to_clip = (
-                        itertools.chain(unet.parameters(), text_encoder.parameters())
-                        if args.train_text_encoder
-                        else unet.parameters()
-                    )
+                    params_to_clip = params_to_optimize
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
@@ -1200,44 +1464,47 @@ def model_finetuning():
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-            if accelerator.is_main_process and global_step % args.pipeline_checkpointing_steps == 0:
-                pipeline = StableDiffusionPipeline.from_pretrained(
-                    args.pretrained_model_name_or_path,
-                    unet=accelerator.unwrap_model(unet),
-                    text_encoder=accelerator.unwrap_model(text_encoder),
-                )
-                save_folder = os.path.join(os.path.join(args.pipeline_checkpoints_output_dir, f"checkpoint-{global_step}"))
-                os.makedirs(save_folder)
-                pipeline.save_pretrained(save_folder)
-
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
+           
+            if accelerator.is_main_process and global_step % args.pipeline_checkpointing_steps == 0:
+                unet = unwrap_model(unet)
+                unet = unet.to(torch.float32)
+
+                unet_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unet))
+
+                if args.train_text_encoder:
+                    text_encoder = unwrap_model(text_encoder)
+                    text_encoder_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(text_encoder))
+                else:
+                    text_encoder_state_dict = None
+
+                LoraLoaderMixin.save_lora_weights(
+                    save_directory=args.output_dir,
+                    unet_lora_layers=unet_lora_state_dict,
+                    text_encoder_lora_layers=text_encoder_state_dict,
+                )
 
             if global_step >= args.max_train_steps:
                 break
 
         accelerator.wait_for_everyone()
 
-    # Create the pipeline using using the trained modules and save it.
-    if accelerator.is_main_process:
-        pipeline = StableDiffusionPipeline.from_pretrained(
-            args.pretrained_model_name_or_path,
-            unet=accelerator.unwrap_model(unet),
-            text_encoder=accelerator.unwrap_model(text_encoder),
-        )
-        pipeline.save_pretrained(args.output_dir)
+    # Save the lora layers
+    # if accelerator.is_main_process:
+    #     unet = unet.to(torch.float32)
+    #     unet.save_attn_procs(args.output_dir)
 
-        if args.push_to_hub:
-            upload_folder(
-                repo_id=repo_id,
-                folder_path=args.output_dir,
-                commit_message="End of training",
-                ignore_patterns=["step_*", "epoch_*"],
-            )
-
+    #     if args.push_to_hub:
+    #         upload_folder(
+    #             repo_id=repo_id,
+    #             folder_path=args.output_dir,
+    #             commit_message="End of training",
+    #             ignore_patterns=["step_*", "epoch_*"],
+    #         )
     accelerator.end_training()
 
 
 if __name__ == "__main__":
-    model_finetuning()
+    main()
