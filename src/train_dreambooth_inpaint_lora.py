@@ -1,3 +1,10 @@
+"""
+    source: https://github.com/huggingface/diffusers/blob/main/examples/research_projects/dreambooth_inpaint/train_dreambooth_inpaint_lora.py
+    TargetedMaskingDatasetWithPriorPreservation class was added to support
+    targetted masking of data as an alternative to random masking. These classes expect the user to provide 
+    the corresponding mask as well. These classes also provide random perturbation of the masks to avoid overfitting.
+"""
+
 import argparse
 import math
 import os

@@ -6,6 +6,9 @@
             (DreamBoothDataset had a single prompt for class images and another prompt for instance images)
         2. PromptDataset replaced with ClassDatasetSampleGeneraion:
             Allows loading of prompts using which class samples can be generated for prior preservation loss
+        3. TargetedMaskingDataset and TargetedMaskingDatasetWithPriorPreservation classes were added to support
+           targetted masking of data as an alternative to random masking. These classes expect the user to provide 
+           the corresponding mask as well. These classes also provide random perturbation of the masks to avoid overfitting.
 """
 
 
@@ -598,6 +601,8 @@ class TargetedMaskingDatasetWithPriorPreservation(Dataset):
                     required_samples_count = 0
                 self.class_image_list.extend(class_image_list)
     
+        assert len(self.class_image_list)==len(self.instance_image_list)
+
         self.image_transforms_resize_and_crop = transforms.Compose(
             [
                 transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BILINEAR),
