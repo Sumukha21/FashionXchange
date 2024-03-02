@@ -4,9 +4,22 @@ Worry not! With our application (in development) you can modify  your clothes wi
 
 ![FashionXchange backend dataflow](./dependencies/workflow.png)
 
-
 Our pipeline for modifying outfits uses GroundingDINO, Segment ANything Model and Stable Diffusion.
 We are currently finetuning our model to make it accurate in modifying outfits. Stay tuned!
+
+## Installation Instructions
+1. Create a conda environment
+
+    `conda env create -f environment.yml`
+
+2. Install GroundingDINO:
+
+    - `git clone https://github.com/IDEA-Research/GroundingDINO.git`
+
+    - `pip install -e ./GroundingDINO`
+
+
+
 
 Reference:
 1. https://arxiv.org/pdf/2112.10752.pdf
