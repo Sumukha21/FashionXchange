@@ -10,32 +10,33 @@ from torchvision.ops import box_convert
 
 def main():
     st.title('FashionXchange')
-    if torch.cuda_is_available():
+    if torch.cuda.is_available():
         device = torch.device("cuda")
     else:
         device = torch.device("cpu")
     # Paths
-    sam_checkpoint_path = "/home/kganapa/projects/FashioXchange/weights/sam_vit_l_0b3195.pth"
-    groundingdino_model_path = "/home/kganapa/projects/FashioXchange/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
-    groundingdino_weights_path = "/home/kganapa/projects/FashioXchange/weights/groundingdino_swint_ogc.pth"
+    sam_checkpoint_path = "GroundingDINO\weights\sam_vit_h_4b8939.pth"
+    groundingdino_model_path = "GroundingDINO\groundingdino\config\GroundingDINO_SwinT_OGC.py"
+    groundingdino_weights_path = "GroundingDINO\weights\groundingdino_swint_ogc.pth"
     # SAM Parameters
-    model_type = "vit_l"
+    model_type = "vit_h"
     sam_model = sam_model_registry[model_type](checkpoint=sam_checkpoint_path).to(device=device)
 
+    # Load SAM Model
     @st.cache_resource
     def load_sam_model():
         return SamPredictor(sam_model)
 
     sam_predictor = load_sam_model()
 
-    # Stable Diffusion
+    # Load Stable Diffusion
     @st.cache_resource
     def load_pipeline():
-        return StableDiffusionInpaintPipeline.from_pretrained("/home/kganapa/projects/FashioXchange/stable-diffusion-2-inpainting").to(device)
+        return StableDiffusionInpaintPipeline.from_pretrained("FashionXchange/FashionXchange_diffuser").to(device)
 
     pipeline = load_pipeline()
 
-    # Grounding DINO
+    # Load Grounding DINO
     @st.cache_resource
     def load_gdino():
         return load_model(groundingdino_model_path, groundingdino_weights_path)
@@ -126,8 +127,8 @@ def main():
                 other_field.empty()
                 for p_i in people_placeholders:
                     p_i.empty()
-                if not st.session_state.data_submitted:    
-                    imageLocation.image(Image.fromarray(people_list[selected_person]).resize((100, 200), 1))
+                if not st.session_state.data_submitted:   
+                    imageLocation.image(Image.fromarray(people_list[selected_person]).resize((300, 400), 1))
                 person = people_list[selected_person]
                 selected_person_box = boxes[selected_person]
                 st.session_state.person_selected = True
